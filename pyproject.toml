@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "texclip"
+version = "0.2.0"
+description = "Type LaTeX math, get a vector graphic you can paste into Affinity (or Inkscape, Illustrator, ...)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Maximilian Goll" }]
+keywords = ["latex", "affinity", "svg", "equations", "vector", "tkinter"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dnd = ["tkinterdnd2"]      # drag the preamble icon into other applications
+dev = ["pytest"]
+
+[project.scripts]
+texclip = "texclip.cli:main"
+
+[project.gui-scripts]
+texclip-gui = "texclip.gui:main"
+
+[project.urls]
+Homepage = "https://github.com/gollm01/TeXclip"
+Issues = "https://github.com/gollm01/TeXclip/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["tex: needs latex + dvisvgm/dvipng on PATH"]
