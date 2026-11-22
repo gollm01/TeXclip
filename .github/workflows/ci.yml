@@ -5,8 +5,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.9", "3.13"]
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.9" }
+          - { os: windows-latest, python: "3.13" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +26,17 @@ jobs:
         with: { python-version: "3.12" }
       - run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends texlive-latex-extra texlive-fonts-extra texlive-science dvipng dvisvgm
+          sudo apt-get install -y --no-install-recommends texlive-latex-extra texlive-fonts-extra texlive-fonts-recommended texlive-science dvipng dvisvgm
       - run: pip install -e .[dev]
-      - run: pytest -q -m tex
+      - name: Compile tests against a real TeX Live
+        run: |
+          set -o pipefail
+          pytest -q -m tex -rf --tb=short 2>&1 | tee pytest.log
+      - name: Surface the failure as an annotation
+        if: failure()
+        run: |
+          python - <<'PY'
+          import pathlib, urllib.parse
+          log = pathlib.Path("pytest.log").read_text(errors="replace")[-3500:]
+          print("::error title=pytest output::" + log.replace("%", "%25").replace("\r", "").replace("\n", "%0A"))
+          PY
