@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "texclip"
-version = "0.2.0"
+version = "0.3.0"
 description = "Type LaTeX math, get a vector graphic you can paste into Affinity (or Inkscape, Illustrator, ...)."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,6 +38,9 @@ Issues = "https://github.com/gollm01/TeXclip/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+texclip = ["assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

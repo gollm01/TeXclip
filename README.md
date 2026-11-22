@@ -1,3 +1,5 @@
+<p align="center"><img src="src/texclip/assets/texclip.svg" width="112" alt="TeXclip icon"></p>
+
 # TeXclip
 
 **Type LaTeX math, get a real vector graphic you can paste straight into Affinity.**
@@ -42,6 +44,18 @@ texclip-gui
 ```
 
 Or without installing: double-click `run_gui.pyw` (Windows) or run `python run_gui.pyw`.
+
+### Desktop icon
+
+```bash
+texclip --shortcut        # or: python -m texclip --shortcut
+```
+
+puts a **TeXclip** shortcut with the app icon on your desktop (Windows `.lnk`, Linux `.desktop`);
+double-click it to start the app without a console window. The same icon is used in the window's
+title bar and as the taskbar button. To pin it to the taskbar, right-click the shortcut or the
+running app and choose *Pin*. The icon sources are in `src/texclip/assets/`; edit the shapes in
+`tools/make_icon.py` and re-run it to restyle (needs Pillow).
 
 ## Using the GUI
 
@@ -108,6 +122,9 @@ any point size, and `standalone` crops tightly to the equation.
 src/texclip/core.py   preamble, LaTeX generation, build, preview, clipboard (no dependencies)
 src/texclip/cli.py    command-line interface
 src/texclip/gui.py    tkinter application
+src/texclip/shortcut.py  desktop shortcut and icon paths
+src/texclip/assets/   icon (SVG, PNG, multi-size ICO)
+tools/make_icon.py    regenerates the icon files
 tests/                pytest suite (compile tests skip themselves without TeX)
 ```
 

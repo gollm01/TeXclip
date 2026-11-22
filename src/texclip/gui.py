@@ -16,6 +16,7 @@ import tkinter as tk
 from tkinter import colorchooser, messagebox, ttk
 
 from . import __version__
+from .shortcut import APP_ID, ICON_ICO, ICON_PNG
 from .core import (FONTS, OUTDIR, PREAMBLE_FILE, Options, build, build_preamble, missing_tools,
                    normalize_color, read_user_preamble, render_png, strip_overrides, to_clipboard)
 
@@ -69,6 +70,7 @@ class App(_Base):
         super().__init__()
         self.cfg = load_cfg()
         self.title(f"TeXclip {__version__}")
+        self._set_icon()
         self.geometry(self.cfg["geometry"])
         self.minsize(820, 520)
         self.q: queue.Queue = queue.Queue()
@@ -90,6 +92,17 @@ class App(_Base):
                                    "Install MiKTeX or TeX Live and restart TeXclip.")
         self.update_preamble()
         self.refresh()
+
+    def _set_icon(self) -> None:
+        """TeXclip icon in the title bar, the taskbar and Alt+Tab (replaces the tkinter feather)."""
+        try:
+            if sys.platform == "win32":
+                self.iconbitmap(default=str(ICON_ICO))
+            else:
+                self._icon_img = tk.PhotoImage(file=str(ICON_PNG))   # keep a reference
+                self.iconphoto(True, self._icon_img)
+        except tk.TclError:
+            pass                                                    # missing asset: keep the default
 
     # ------------------------------------------------------------------ UI construction
     def _build_ui(self) -> None:
@@ -531,6 +544,10 @@ def main() -> None:
         try:
             import ctypes
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:  # noqa: BLE001
+            pass
+        try:                                         # own taskbar button + icon instead of python.exe's
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:  # noqa: BLE001
             pass
     App().mainloop()

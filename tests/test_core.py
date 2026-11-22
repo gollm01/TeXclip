@@ -108,3 +108,21 @@ def test_latex_error_is_reported(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
     with pytest.raises(RuntimeError, match="Undefined control sequence"):
         core.render_png(r"\nosuchmacro", Options())
+
+
+# ---- icon / shortcut --------------------------------------------------------------------
+def test_icon_assets_present_and_multisize():
+    from texclip import shortcut
+    assert shortcut.ICON_PNG.read_bytes()[:4] == b"\x89PNG"
+    ico = shortcut.ICON_ICO.read_bytes()
+    assert ico[:4] == b"\x00\x00\x01\x00"                  # ICO header
+    assert int.from_bytes(ico[4:6], "little") >= 4          # several sizes: 16, 32, 48, 256 ...
+    assert "<svg" in (shortcut.ASSETS / "texclip.svg").read_text(encoding="utf-8")
+
+
+def test_launch_command_points_to_something_runnable():
+    import os
+    from texclip import shortcut
+    exe, args = shortcut.launch_command()
+    assert os.path.exists(exe)
+    assert args == ["-m", "texclip"] or args[0].endswith("run_gui.pyw")

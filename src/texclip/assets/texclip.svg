@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="256" height="256">
+  <title>TeXclip</title>
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="#003049"/>
+  <rect x="232" y="190" width="560" height="670" rx="70" fill="#f6f2ec"/>
+  <rect x="382" y="120" width="260" height="180" rx="56" fill="#fb8b24"/>
+  <rect x="452" y="168" width="120" height="46" rx="23" fill="#003049"/>
+  <polygon points="340,380 684,380 684,444 462,444 558,590 462,736 684,736 684,800 340,800 478,590" fill="#003049"/>
+</svg>

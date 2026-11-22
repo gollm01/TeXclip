@@ -1,2 +1,2 @@
 """TeXclip - LaTeX equations as vector graphics for Affinity (and any other vector editor)."""
-__version__ = "0.2.0"
+__version__ = "0.3.0"

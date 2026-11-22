@@ -36,9 +36,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--border", type=float, default=0.5, help="padding in pt")
     p.add_argument("--no-clip", action="store_true", help="only write the file")
     p.add_argument("--fonts", action="store_true", help="list font styles and exit")
+    p.add_argument("--shortcut", action="store_true", help="create a desktop shortcut with the TeXclip icon and exit")
     p.add_argument("--version", action="version", version=f"texclip {__version__}")
     args = p.parse_args(argv)
 
+    if args.shortcut:
+        from .shortcut import create_shortcut
+        try:
+            print("created", create_shortcut())
+        except RuntimeError as e:
+            sys.exit(str(e))
+        return
     if args.fonts:
         for k, (_, d) in FONTS.items():
             print(f"  {k:9s} {d}")
