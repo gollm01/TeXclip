@@ -39,7 +39,7 @@ NO_AMSSYMB_PACKAGES = {"newtxmath", "newpxmath", "newtx", "newpx", "stix", "stix
 # dvisvgm on MiKTeX finds the CM Bright outlines only through this map
 EXTRA_FONTMAPS = {"sans": "hfbright.map"}
 
-PASTE_MODES = ("object", "curves", "both")
+PASTE_MODES = ("object", "curves")
 
 # value for size / color / font meaning "do not override, take it from the preamble file"
 FROM_PREAMBLE = "preamble"
@@ -90,7 +90,7 @@ class Options:
     bold: bool = False          # \boldmath
     inline: bool = False        # text style instead of display style
     border: float = 0.5         # padding in pt
-    paste: str = "object"       # object | curves | both
+    paste: str = "object"       # object (one compound path) | curves (one path per glyph)
     format: str = "svg"         # svg | pdf
     no_clip: bool = False       # only write the file
 
@@ -335,21 +335,230 @@ def render_png(eq: str, a: Options, dpi: int = 200, user_preamble: str | None = 
 
 
 # --------------------------------------------------------------------------- clipboard
+# --------------------------------------------------------------------------- SVG flattening
+_NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+_XLINK = "{http://www.w3.org/1999/xlink}href"
+
+
+def _parse_transform(t: str | None):
+    """SVG transform list -> affine (a, b, c, d, e, f)."""
+    m = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    for name, args in re.findall(r"(\w+)\s*\(([^)]*)\)", t or ""):
+        v = [float(x) for x in re.findall(_NUM, args)]
+        if name == "translate":
+            n = (1, 0, 0, 1, v[0], v[1] if len(v) > 1 else 0)
+        elif name == "scale":
+            n = (v[0], 0, 0, v[1] if len(v) > 1 else v[0], 0, 0)
+        elif name == "matrix":
+            n = tuple(v)
+        elif name == "rotate":
+            import math
+            a = math.radians(v[0])
+            n = (math.cos(a), math.sin(a), -math.sin(a), math.cos(a), 0, 0)
+            if len(v) == 3:
+                m = _mul(m, (1, 0, 0, 1, v[1], v[2]))
+                m = _mul(m, n)
+                n = (1, 0, 0, 1, -v[1], -v[2])
+        else:
+            raise ValueError(f"transform {name} not supported")
+        m = _mul(m, n)
+    return m
+
+
+def _mul(m, n):
+    a, b, c, d, e, f = m
+    A, B, C, D, E, F = n
+    return (a * A + c * B, b * A + d * B, a * C + c * D, b * C + d * D, a * E + c * F + e, b * E + d * F + f)
+
+
+def _path_abs(d: str, m) -> str:
+    """Rewrite path data with all coordinates transformed by m, as absolute M/L/C/Q/Z."""
+    a, b, c, dd, e, f = m
+    tp = lambda x, y: (a * x + c * y + e, b * x + dd * y + f)
+    fmt = lambda p: f"{p[0]:.3f} {p[1]:.3f}"
+    toks = re.findall(r"[A-Za-z]|" + _NUM, d)
+    out, i, cmd = [], 0, ""
+    cx = cy = sx = sy = 0.0
+    last_ctrl = None                    # (x, y, kind) for S/T reflection
+    while i < len(toks):
+        if toks[i].isalpha():
+            cmd = toks[i]
+            i += 1
+        rel = cmd.islower()
+        C = cmd.upper()
+
+        def nums(k):
+            nonlocal i
+            vals = [float(x) for x in toks[i:i + k]]
+            i += k
+            return vals
+        if C == "Z":
+            out.append("Z")
+            cx, cy, last_ctrl = sx, sy, None
+            continue
+        if C in "ML":
+            x, y = nums(2)
+            if rel:
+                x, y = cx + x, cy + y
+            out.append(("M " if C == "M" else "L ") + fmt(tp(x, y)))
+            cx, cy, last_ctrl = x, y, None
+            if C == "M":
+                sx, sy = x, y
+                cmd = "l" if rel else "L"       # further pairs are line-tos
+        elif C in "HV":
+            (v,) = nums(1)
+            if C == "H":
+                cx = cx + v if rel else v
+            else:
+                cy = cy + v if rel else v
+            out.append("L " + fmt(tp(cx, cy)))
+            last_ctrl = None
+        elif C in "CS":
+            if C == "C":
+                x1, y1, x2, y2, x, y = nums(6)
+                if rel:
+                    x1, y1, x2, y2, x, y = cx + x1, cy + y1, cx + x2, cy + y2, cx + x, cy + y
+            else:
+                x2, y2, x, y = nums(4)
+                if rel:
+                    x2, y2, x, y = cx + x2, cy + y2, cx + x, cy + y
+                x1, y1 = (2 * cx - last_ctrl[0], 2 * cy - last_ctrl[1]) if last_ctrl and last_ctrl[2] == "C" else (cx, cy)
+            out.append("C " + " ".join(fmt(tp(*p)) for p in ((x1, y1), (x2, y2), (x, y))))
+            cx, cy, last_ctrl = x, y, (x2, y2, "C")
+        elif C in "QT":
+            if C == "Q":
+                x1, y1, x, y = nums(4)
+                if rel:
+                    x1, y1, x, y = cx + x1, cy + y1, cx + x, cy + y
+            else:
+                x, y = nums(2)
+                if rel:
+                    x, y = cx + x, cy + y
+                x1, y1 = (2 * cx - last_ctrl[0], 2 * cy - last_ctrl[1]) if last_ctrl and last_ctrl[2] == "Q" else (cx, cy)
+            out.append("Q " + " ".join(fmt(tp(*p)) for p in ((x1, y1), (x, y))))
+            cx, cy, last_ctrl = x, y, (x1, y1, "Q")
+        else:
+            raise ValueError(f"path command {cmd} not supported")
+    return " ".join(out)
+
+
+def _outer_sign(d: str) -> int:
+    """Orientation (+1/-1) of the largest subpath of absolute path data (end points only)."""
+    best, sign = 0.0, 0
+    for sub in re.split(r"(?=M )", d):
+        nums = [float(x) for x in re.findall(_NUM, sub)]
+        pts = list(zip(nums[0::2], nums[1::2]))
+        if len(pts) < 3:
+            continue
+        area = sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]))
+        if abs(area) > best:
+            best, sign = abs(area), (1 if area > 0 else -1)
+    return sign
+
+
+def _rect_path(x, y, w, h, m, positive: bool) -> str:
+    corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    d = "M{} {}L{} {}L{} {}L{} {}Z".format(*[v for p in corners for v in p])
+    out = _path_abs(d, m)
+    return out if (_outer_sign(out) > 0) == positive else _path_abs(
+        "M{} {}L{} {}L{} {}L{} {}Z".format(*[v for p in corners[::-1] for v in p]), m)
+
+
+def flatten_svg(svg_text: str, merge: bool = True) -> str:
+    """Resolve the glyph references of a dvisvgm SVG into plain paths.
+
+    ``merge=True``: one compound path per colour (one object in Affinity);
+    ``merge=False``: one path per glyph / rule. Raises ValueError for anything unexpected."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(svg_text)
+    defs = {el.get("id"): el for el in root.iter() if el.get("id")}
+    pieces: list[tuple[str, str]] = []           # (colour, path data)
+
+    def glyph(el, m, fill, depth=0):
+        tag = el.tag.rsplit("}", 1)[-1]
+        if depth > 20:
+            raise ValueError("reference loop")
+        fill = el.get("fill", fill)
+        m = _mul(m, _parse_transform(el.get("transform")))
+        if tag == "use":
+            ref = defs.get((el.get(_XLINK) or el.get("href") or "#")[1:])
+            if ref is None:
+                raise ValueError("dangling <use>")
+            m = _mul(m, (1, 0, 0, 1, float(el.get("x", 0)), float(el.get("y", 0))))
+            glyph(ref, m, fill, depth + 1)
+        elif tag == "path":
+            pieces.append((fill, _path_abs(el.get("d", ""), m)))
+        elif tag == "rect":       # rules (fraction bars, roots): drawn later in glyph direction
+            x, y, w, h = (float(el.get(k, 0)) for k in ("x", "y", "width", "height"))
+            pieces.append((fill, ("rect", x, y, w, h, m)))
+        elif tag == "g":
+            for ch in el:
+                glyph(ch, m, fill, depth)
+        elif tag in ("defs", "title", "desc", "style"):
+            return
+        else:
+            raise ValueError(f"<{tag}> not supported")
+
+    page = next((e for e in root if e.tag.rsplit("}", 1)[-1] == "g"), None)
+    if page is None:
+        raise ValueError("no drawing found")
+    glyph(page, (1.0, 0.0, 0.0, 1.0, 0.0, 0.0), root.get("fill", "#000"))
+    # In one compound path (nonzero fill) a rule overlapping a glyph must run in the same
+    # direction as the glyph outlines, otherwise the overlap becomes a hole.
+    signs = [_outer_sign(d) for _, d in pieces if isinstance(d, str)]
+    cw = sum(signs) >= 0
+    pieces = [(col, d if isinstance(d, str) else _rect_path(*d[1:], cw)) for col, d in pieces]
+    if merge:
+        by_color: dict[str, list[str]] = {}
+        for col, d in pieces:
+            by_color.setdefault(col, []).append(d)
+        paths = [f'<path d="{" ".join(ds)}" fill="{col}"/>' for col, ds in by_color.items()]
+    else:
+        paths = [f'<path d="{d}" fill="{col}"/>' for col, d in pieces]
+    head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{root.get("width")}" '
+            f'height="{root.get("height")}" viewBox="{root.get("viewBox")}">')
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + head + "\n" + "\n".join(paths) + "\n</svg>\n"
+
+
+def clipboard_svg(path: Path, mode: str) -> str:
+    """SVG text to put on the clipboard for a paste mode (falls back to the file as is)."""
+    text = path.read_text(encoding="utf-8")
+    try:
+        return flatten_svg(text, merge=(mode != "curves"))
+    except (ValueError, IndexError, KeyError) as e:   # unexpected SVG structure: keep the original
+        print(f"texclip: could not flatten SVG ({e}); copying it unchanged", file=sys.stderr)
+        return text
+
+
+# Affinity reads SVG from the clipboard under Inkscape's and Illustrator's format names (not
+# image/svg+xml), and PDF under "Portable Document Format".
+SVG_CLIP_FORMATS = ("image/x-inkscape-svg", "Scalable Vector Graphics", "image/svg+xml")
+
+
 def to_clipboard(path: Path, mode: str) -> bool:
     if sys.platform == "win32":
-        p = str(path).replace("'", "''")
         ps = ["Add-Type -AssemblyName System.Windows.Forms",
               "$d = New-Object System.Windows.Forms.DataObject"]
-        if mode in ("object", "both"):      # the file itself -> Affinity embeds it as one object
-            ps += ["$f = New-Object System.Collections.Specialized.StringCollection",
-                   f"[void]$f.Add('{p}')", "$d.SetFileDropList($f)"]
-        if mode in ("curves", "both") and path.suffix == ".svg":   # SVG data -> curves
-            ps += [f"$b = [IO.File]::ReadAllBytes('{p}')",
-                   "$d.SetData('image/svg+xml', (New-Object IO.MemoryStream(,$b)))",
-                   f"$d.SetText([IO.File]::ReadAllText('{p}'))"]
+        tmp = None
+        if path.suffix == ".svg":
+            fd, name = tempfile.mkstemp(suffix=".svg")
+            os.close(fd)
+            tmp = Path(name)
+            tmp.write_text(clipboard_svg(path, mode), encoding="utf-8")
+            q = str(tmp).replace("'", "''")
+            ps.append(f"$b = [IO.File]::ReadAllBytes('{q}')")
+            ps += [f"$d.SetData('{fmt}', (New-Object IO.MemoryStream(,$b)))" for fmt in SVG_CLIP_FORMATS]
+        else:
+            q = str(path).replace("'", "''")
+            ps += [f"$b = [IO.File]::ReadAllBytes('{q}')",
+                   "$d.SetData('Portable Document Format', (New-Object IO.MemoryStream(,$b)))"]
         ps.append("[System.Windows.Forms.Clipboard]::SetDataObject($d, $true)")
-        subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", "; ".join(ps)],
-                       check=True, **_nowindow())
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", "; ".join(ps)],
+                           check=True, **_nowindow())
+        finally:
+            if tmp:
+                tmp.unlink(missing_ok=True)
         return True
     if sys.platform == "darwin":
         cls = "«class PDF »" if path.suffix == ".pdf" else "«class utf8»"

@@ -157,6 +157,27 @@ def test_every_font_gives_glyph_paths(font, tmp_path, monkeypatch):
 
 @needs_tex
 @pytest.mark.tex
+def test_flatten_svg_for_the_clipboard(tmp_path, monkeypatch):
+    """object = one compound path per colour, curves = one path per glyph; no <use> left."""
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    svg = core.build(r"\sqrt{x}+\frac{a}{b}", Options()).read_text(encoding="utf-8")
+    one = core.flatten_svg(svg, merge=True)
+    many = core.flatten_svg(svg, merge=False)
+    assert one.count("<path") == 1 and "<use" not in one
+    assert many.count("<path") >= 5 and "<use" not in many
+    two = core.flatten_svg(core.build(r"\textcolor{red}{a}+b", Options()).read_text(encoding="utf-8"))
+    assert two.count("<path") == 2                        # one per colour
+
+
+def test_affinity_clipboard_formats():
+    # Affinity reads SVG from the clipboard only under these names (see Serif.Win32.dll)
+    assert {"image/x-inkscape-svg", "Scalable Vector Graphics"} <= set(core.SVG_CLIP_FORMATS)
+    assert core.PASTE_MODES == ("object", "curves")
+
+
+@needs_tex
+@pytest.mark.tex
 def test_size_from_preamble_takes_effect(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
     a = Options(size=core.FROM_PREAMBLE)

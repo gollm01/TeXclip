@@ -39,9 +39,8 @@ except Exception:  # pragma: no cover
 CFG_FILE = os.path.join(os.path.expanduser("~"), ".texclip_gui.json")
 FONT_LABELS = {k: f"{k} - {d}" for k, (_, d) in FONTS.items()}
 KEY_FROM_LABEL = {v: k for k, v in FONT_LABELS.items()}
-PASTE_LABELS = {"object": "One vector object (scales as a whole)",
-                "curves": "Curves (every glyph editable)",
-                "both": "Both (pastes two objects)"}
+PASTE_LABELS = {"object": "One object (the whole equation is a single curve)",
+                "curves": "Curves (one curve per glyph, editable)"}
 PASTE_FROM_LABEL = {v: k for k, v in PASTE_LABELS.items()}
 ZOOMS = ["100 %", "150 %", "200 %", "300 %", "400 %"]
 APPEARANCES = ["Light", "Dark", "System"]
@@ -226,7 +225,8 @@ class App(ctk.CTk, _DnD):
         sf.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         sf.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(sf, text="Style", font=bold).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 2))
-        ctk.CTkLabel(sf, text="use preamble", text_color=MUTED).grid(row=0, column=2, padx=12, pady=(8, 2))
+        ctk.CTkLabel(sf, text="these fields override your preamble file",
+                     text_color=MUTED).grid(row=0, column=1, columnspan=2, sticky="e", padx=12, pady=(8, 2))
         self.v_size, self.v_color, self.v_font = tk.StringVar(), tk.StringVar(), tk.StringVar()
         self.v_border, self.v_paste = tk.StringVar(), tk.StringVar()
         self.v_bold, self.v_inline = tk.BooleanVar(), tk.BooleanVar()
@@ -236,8 +236,8 @@ class App(ctk.CTk, _DnD):
             ctk.CTkLabel(sf, text=text).grid(row=r, column=0, sticky="w", padx=12, pady=4)
 
         def pre_box(r, var):
-            ctk.CTkCheckBox(sf, text="", variable=var, width=24, command=self._on_pre_toggle).grid(
-                row=r, column=2, padx=12)
+            ctk.CTkCheckBox(sf, text="from preamble", variable=var, checkbox_width=20, checkbox_height=20,
+                            command=self._on_pre_toggle).grid(row=r, column=2, sticky="w", padx=(8, 12))
 
         row_label(1, "Font size")
         r = ctk.CTkFrame(sf, fg_color="transparent")
@@ -476,6 +476,10 @@ class App(ctk.CTk, _DnD):
     def _on_pre_toggle(self) -> None:
         self._apply_pre_states()
         self._on_style()
+        pre = [n for n, v in (("size", self.v_size_pre), ("colour", self.v_color_pre),
+                              ("font", self.v_font_pre)) if v.get()]
+        self.set_status(("From the preamble file: " + ", ".join(pre) + ". The other fields still override it.")
+                        if pre else "All style fields override the preamble file.")
 
     def _apply_pre_states(self) -> None:
         """Fields taken from the preamble are greyed out."""

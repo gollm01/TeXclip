@@ -100,10 +100,12 @@ need Ghostscript for `dvisvgm`; `braket` clashes with `physics`.
 
 | Mode | Result in Affinity |
 |---|---|
-| **object** (default) | one embedded vector object, scales as a whole |
-| **curves** | converted to curves, every glyph selectable and editable |
-| **both** | pastes both at once (rarely wanted) |
+| **object** (default) | the whole equation is one curve (one per colour), scales as a whole |
+| **curves** | one curve per glyph, each selectable and editable |
 
+On Windows, the SVG goes on the clipboard under the format names Affinity reads:
+`image/x-inkscape-svg` (Inkscape's) and `Scalable Vector Graphics` (Illustrator's).
+`image/svg+xml` is added for other programs. Glyph references are resolved into plain paths first.
 If pasting fails, drag the `.svg` from the output folder onto the canvas or use *File > Place*.
 
 ## Command line

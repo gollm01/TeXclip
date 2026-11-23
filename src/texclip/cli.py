@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--bold", action="store_true", help="bold math (\\boldmath)")
     p.add_argument("--inline", action="store_true", help="text style instead of display style")
     p.add_argument("--paste", default="object", choices=PASTE_MODES,
-                   help="object = one scalable object (default), curves = editable glyphs")
+                   help="object = the equation as one curve (default), curves = one curve per glyph")
     p.add_argument("--format", default="svg", choices=["svg", "pdf"], help="default svg")
     p.add_argument("--border", type=float, default=0.5, help="padding in pt")
     p.add_argument("--no-clip", action="store_true", help="only write the file")
