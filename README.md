@@ -9,17 +9,23 @@ your own TeX installation, converts every glyph to a path (so no Computer Modern
 on the other side), and puts the result on the clipboard. Press `Ctrl+V` in Affinity and you have
 a crisp, infinitely scalable equation. The SVG also works in Inkscape, Illustrator, Figma, etc.
 
-![TeXclip window](docs/screenshot.png)
+| Light | Dark |
+|---|---|
+| ![TeXclip window, light theme](docs/screenshot.png) | ![TeXclip window, dark theme](docs/screenshot_dark.png) |
 
 ## Features
 
 - **Live preview** that updates while you type (debounced, never blocks the window).
-- **Style fields that override your preamble:** font size, colour (hex or colour picker), font
-  family (Computer Modern, Latin Modern, Times, Palatino, Utopia, Kp, Euler, CM Bright), bold,
-  inline/display style, border padding.
-- **Preamble icon:** one click copies the *personalised* preamble (your font, packages and personal
-  macros, with the chosen colour as `eqcolor`) so your paper or poster matches the equations you
-  paste. With the optional `tkinterdnd2` package you can also drag the icon into an editor.
+- **Style fields:** font size, colour (hex or colour picker), font family (Computer Modern, Latin
+  Modern, Times, Palatino, Utopia, Kp, Euler, CM Bright), bold, inline/display style, border
+  padding. They override your preamble, unless you tick **use preamble** next to size, colour or
+  font. Then the setting from your preamble file is used, for anything more detailed than the
+  fields allow.
+- **Preamble icon:** click it to choose a preamble file, or drop a `.tex` file onto it. The file
+  becomes your personal preamble, and the previous one is kept as a `.bak`. The *Preamble* tab
+  shows the resulting preamble and copies it to the clipboard, so your paper or poster matches the
+  equations you paste.
+- **Modern interface** (customtkinter) with a **light, dark or system** theme.
 - **Two paste modes:** one scalable object, or curves with every glyph individually editable.
 - Equation history, remembers your settings, "always on top" so it can float next to Affinity.
 - Also a **command-line tool** for scripts and batch conversion.
@@ -28,7 +34,7 @@ a crisp, infinitely scalable equation. The SVG also works in Inkscape, Illustrat
 
 | | |
 |---|---|
-| Python | 3.9 or newer (tkinter is included with the standard installers). No other Python packages. |
+| Python | 3.9 or newer, with tkinter (included with the standard installers). `pip install .` also installs `customtkinter` and `tkinterdnd2`. |
 | TeX | A distribution that provides `latex`, `dvisvgm` and `dvipng`: [MiKTeX](https://miktex.org) (Windows), [TeX Live](https://tug.org/texlive/) (Linux), [MacTeX](https://tug.org/mactex/) (macOS). Missing LaTeX packages are installed on first use by MiKTeX (a pop-up may appear). |
 | Clipboard | Windows: built in (PowerShell). macOS: built in (`osascript`). Linux: `xclip`. |
 
@@ -53,7 +59,8 @@ texclip --shortcut        # or: python -m texclip --shortcut
 
 puts a **TeXclip** shortcut with the app icon on your desktop (Windows `.lnk`, Linux `.desktop`);
 double-click it to start the app without a console window. The same icon is used in the window's
-title bar and as the taskbar button. To pin it to the taskbar, right-click the shortcut or the
+title bar and on the taskbar button. The taskbar button gets its own identity, so it shows the
+TeXclip icon even with the Microsoft Store Python. To pin it to the taskbar, right-click the shortcut or the
 running app and choose *Pin*. The icon sources are in `src/texclip/assets/`; edit the shapes in
 `tools/make_icon.py` and re-run it to restyle (needs Pillow).
 
@@ -63,7 +70,7 @@ running app and choose *Pin*. The icon sources are in `src/texclip/assets/`; edi
    `align`, `gather` and `equation` environments are fine; they are shrunk to fit.
 2. Adjust size, colour and font on the left. The preview follows after half a second.
 3. Press **Ctrl+Enter** (or *Copy to clipboard*), then **Ctrl+V** in Affinity.
-4. Click the **document icon** at the top left to copy the matching LaTeX preamble.
+4. *Preamble* tab > **Copy preamble** copies the matching LaTeX preamble for your document.
 
 | Shortcut | Action |
 |---|---|
@@ -72,11 +79,19 @@ running app and choose *Pin*. The icon sources are in `src/texclip/assets/`; edi
 
 ### Your personal preamble
 
-Put your own packages and macros in `~/.texclip_preamble.tex` (button *Edit preamble file*; a leftover `~/.tex2aff_preamble.tex` from the earlier script is picked up if the new file does not exist). They
-are inserted after the base packages (`amsmath`, `amssymb`, `mathtools`, `physics`, `xcolor`).
-The **Style** fields always win: font packages (`lmodern`, `newtxmath`, ...), `\color`,
-`\pagecolor`, `\fontsize` and bare size switches in that file are neutralised automatically, and
-the *Preamble* tab lists exactly what was replaced.
+Your own packages and macros live in `~/.texclip_preamble.tex`. To replace it, click the
+**preamble icon** or drop a file onto it. A complete `.tex` file works too, because
+`\documentclass` and everything from `\begin{document}` on are dropped. To edit it, use
+*Preamble* tab > *Edit file*. A leftover `~/.tex2aff_preamble.tex` from the earlier script is
+picked up if the new file does not exist. The preamble is inserted after the base packages
+(`amsmath`, `amssymb`, `mathtools`, `physics`, `xcolor`).
+
+By default the **Style** fields win: font packages (`lmodern`, `helvet`, `newtxmath`, ...),
+`\color`, `\pagecolor`, `\fontsize` and bare size switches in that file are neutralised. Tick
+**use preamble** next to a field to keep the preamble's setting instead. For example, keep a
+`helvet` + `mathastext` set-up as the font, or a `\fontsize{24}{29}\selectfont`. Size lines are
+moved into `\AtBeginDocument` automatically, because LaTeX resets the size at `\begin{document}`.
+The *Preamble* tab lists exactly what was replaced.
 
 Notes: the preamble has to work with plain `latex` (DVI), not XeLaTeX/LuaLaTeX; TikZ and pstricks
 need Ghostscript for `dvisvgm`; `braket` clashes with `physics`.
@@ -100,6 +115,7 @@ texclip --paste curves '\int_0^\infty e^{-x^2}\,dx'
 texclip -f equations.txt          # one equation per line -> files only
 texclip -i -s 12 --font palatino  # interactive loop
 texclip --fonts                   # list the font styles
+texclip -s preamble --font preamble 'x^2'   # size and font from the preamble file
 ```
 
 In PowerShell use single quotes (`cmd.exe` treats `^` as an escape character).
@@ -121,8 +137,8 @@ any point size, and `standalone` crops tightly to the equation.
 ```
 src/texclip/core.py   preamble, LaTeX generation, build, preview, clipboard (no dependencies)
 src/texclip/cli.py    command-line interface
-src/texclip/gui.py    tkinter application
-src/texclip/shortcut.py  desktop shortcut and icon paths
+src/texclip/gui.py    customtkinter application
+src/texclip/shortcut.py  desktop shortcut, taskbar identity, icon paths
 src/texclip/assets/   icon (SVG, PNG, multi-size ICO)
 tools/make_icon.py    regenerates the icon files
 tests/                pytest suite (compile tests skip themselves without TeX)
@@ -137,8 +153,8 @@ pytest
 
 ## Known limitations
 
-- Drag-and-drop of the preamble icon needs `pip install tkinterdnd2` and was only
-  smoke-tested; clicking always works.
+- Dropping a file onto the preamble icon needs `tkinterdnd2` (installed with TeXclip). Clicking
+  the icon always works.
 - Tested on Windows 11 with MiKTeX. The macOS and Linux clipboard paths are kept from the original
   script but not tested by the author.
 - Only fonts available as `pdflatex`/`latex` packages are offered (no OpenType via `fontspec`).

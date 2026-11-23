@@ -1,7 +1,7 @@
 """TeXclip GUI: type LaTeX math, see it rendered, copy it as a vector object for Affinity.
 
-tkinter only (stdlib). Optional: ``pip install tkinterdnd2`` enables dragging the preamble icon
-into other applications as text.
+Built with customtkinter (light / dark / system theme). tkinterdnd2 adds dropping a preamble
+file onto the preamble icon; without it, clicking the icon still opens a file dialog.
 """
 from __future__ import annotations
 
@@ -13,18 +13,28 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from tkinter import colorchooser, messagebox, ttk
+from pathlib import Path
+from tkinter import colorchooser, filedialog, messagebox
+
+try:
+    import customtkinter as ctk
+except ImportError:  # pragma: no cover - friendly message for a double-click start
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("TeXclip", "TeXclip needs customtkinter:\n\n    pip install customtkinter tkinterdnd2")
+    raise SystemExit(1)
 
 from . import __version__
-from .shortcut import APP_ID, ICON_ICO, ICON_PNG
-from .core import (FONTS, OUTDIR, PREAMBLE_FILE, Options, build, build_preamble, missing_tools,
-                   normalize_color, read_user_preamble, render_png, strip_overrides, to_clipboard)
+from .core import (FONTS, FROM_PREAMBLE, OUTDIR, PREAMBLE_FILE, Options, build, build_preamble,
+                   install_preamble, missing_tools, normalize_color, read_user_preamble, render_png,
+                   strip_overrides, to_clipboard)
+from .shortcut import APP_ID, ICON_ICO, ICON_PNG, set_window_identity
 
-try:  # optional drag & drop
-    from tkinterdnd2 import DND_TEXT, TkinterDnD
-    _Base = TkinterDnD.Tk
+try:  # optional: drop files onto the preamble icon
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DnD = TkinterDnD.DnDWrapper
 except Exception:  # pragma: no cover
-    DND_TEXT, _Base = None, tk.Tk
+    DND_FILES, TkinterDnD, _DnD = None, None, object
 
 CFG_FILE = os.path.join(os.path.expanduser("~"), ".texclip_gui.json")
 FONT_LABELS = {k: f"{k} - {d}" for k, (_, d) in FONTS.items()}
@@ -33,14 +43,42 @@ PASTE_LABELS = {"object": "One vector object (scales as a whole)",
                 "curves": "Curves (every glyph editable)",
                 "both": "Both (pastes two objects)"}
 PASTE_FROM_LABEL = {v: k for k, v in PASTE_LABELS.items()}
-ZOOMS = ["100", "150", "200", "300", "400"]
-MONO = ("Consolas", 12) if sys.platform == "win32" else ("Menlo", 12)
+ZOOMS = ["100 %", "150 %", "200 %", "300 %", "400 %"]
+APPEARANCES = ["Light", "Dark", "System"]
+MONO = ("Consolas", 14) if sys.platform == "win32" else ("Menlo", 13)
 PREAMBLE_STUB = ("% TeXclip personal preamble - inserted after the base packages.\n"
-                 "% Font, size and colour are set in the TeXclip window and override anything set here.\n"
+                 "% Font, size and colour come from the TeXclip window unless you tick 'preamble'\n"
+                 "% next to them; then the settings made here are used.\n"
                  "% Example:\n% \\newcommand{\\Hamil}{\\hat{H}}\n")
-DEFAULTS = dict(size="10", color="000000", font="cm", bold=False, inline=False, border="0.5",
-                paste="object", zoom="200", topmost=False, history=[], eq=r"i\hbar\,\partial_t\ket{\psi}=\hat H\ket{\psi}",
-                geometry="1120x700")
+DEFAULTS = dict(size="10", color="000000", font="cm", size_pre=False, color_pre=False, font_pre=False,
+                bold=False, inline=False, border="0.5", paste="object", zoom="200 %", topmost=False,
+                appearance="System", history=[], last_dir="",
+                eq=r"i\hbar\,\partial_t\ket{\psi}=\hat H\ket{\psi}", geometry="1180x760")
+
+# TeXclip palette (light, dark) - from the icon
+TEAL = ("#0f4c5c", "#17687d")
+TEAL_HOVER = ("#003049", "#1f8099")
+ORANGE, ORANGE_HOVER = "#fb8b24", "#e07612"
+RED = ("#c0392b", "#ff6b5b")
+MUTED = ("gray40", "gray65")
+
+
+def _theme() -> None:
+    """Recolour customtkinter's blue theme with the TeXclip teal."""
+    ctk.set_default_color_theme("blue")
+    t = ctk.ThemeManager.theme
+    for widget, keys in {"CTkButton": ("fg_color",), "CTkCheckBox": ("fg_color",),
+                         "CTkSwitch": ("progress_color",), "CTkSegmentedButton": ("selected_color",),
+                         "CTkOptionMenu": ("fg_color",), "CTkSlider": ("button_color", "progress_color")}.items():
+        for k in keys:
+            if k in t.get(widget, {}):
+                t[widget][k] = list(TEAL)
+    for widget, k in (("CTkButton", "hover_color"), ("CTkCheckBox", "hover_color"),
+                      ("CTkSegmentedButton", "selected_hover_color"), ("CTkOptionMenu", "button_color")):
+        if k in t.get(widget, {}):
+            t[widget][k] = list(TEAL_HOVER)
+    if "CTkOptionMenu" in t:
+        t["CTkOptionMenu"]["button_hover_color"] = ["#002536", "#2391ad"]
 
 
 def load_cfg() -> dict:
@@ -63,16 +101,25 @@ def open_path(p) -> None:
         subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(p)])
 
 
-class App(_Base):
+class App(ctk.CTk, _DnD):
     PAD = 16
 
     def __init__(self) -> None:
         super().__init__()
+        self.withdraw()                               # shown once the taskbar identity is set
+        self.dnd = False
+        if TkinterDnD is not None:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self.dnd = True
+            except Exception:  # noqa: BLE001 - tkdnd binary missing for this platform
+                pass
         self.cfg = load_cfg()
+        ctk.set_appearance_mode(self.cfg["appearance"])
         self.title(f"TeXclip {__version__}")
         self._set_icon()
         self.geometry(self.cfg["geometry"])
-        self.minsize(820, 520)
+        self.minsize(900, 600)
         self.q: queue.Queue = queue.Queue()
         self.gen = 0                     # id of the newest preview request; older results are dropped
         self._after = None
@@ -80,10 +127,19 @@ class App(_Base):
         self._error = ""
         self._busy = 0
         self._pre_mtime = self._mtime()
+        self._mode = ctk.get_appearance_mode()
         self.preamble_text = ""
 
         self._build_ui()
         self._load_into_ui()
+        self.update_idletasks()
+        if sys.platform == "win32":                   # own taskbar button with the TeXclip icon
+            try:
+                set_window_identity(int(self.wm_frame(), 16))
+            except (ValueError, tk.TclError):
+                pass
+        # let customtkinter show the window as usual (after it has set the title bar colour)
+        self._withdraw_called_before_window_exists = False
         self._poll_id = self.after(60, self._poll)
         self.bind("<FocusIn>", self._on_focus)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -94,201 +150,271 @@ class App(_Base):
         self.refresh()
 
     def _set_icon(self) -> None:
-        """TeXclip icon in the title bar, the taskbar and Alt+Tab (replaces the tkinter feather)."""
+        """TeXclip icon in the title bar and Alt+Tab (replaces the default icon)."""
         try:
             if sys.platform == "win32":
-                self.iconbitmap(default=str(ICON_ICO))
+                self.iconbitmap(default=str(ICON_ICO))      # also for dialogs
+                self.iconbitmap(str(ICON_ICO))              # tells customtkinter not to set its own
             else:
-                self._icon_img = tk.PhotoImage(file=str(ICON_PNG))   # keep a reference
+                self._icon_img = tk.PhotoImage(file=str(ICON_PNG))
                 self.iconphoto(True, self._icon_img)
         except tk.TclError:
-            pass                                                    # missing asset: keep the default
+            pass
 
     # ------------------------------------------------------------------ UI construction
     def _build_ui(self) -> None:
-        ttk.Style(self).theme_use("vista" if sys.platform == "win32" else "clam")
-        bar = ttk.Frame(self, padding=(10, 8))
-        bar.pack(fill="x")
-        self.icon = self._make_preamble_icon(bar)
+        self.grid_columnconfigure(0, weight=2, uniform="cols")
+        self.grid_columnconfigure(1, weight=3, uniform="cols")
+        self.grid_rowconfigure(1, weight=1)
+        bold = ctk.CTkFont(size=14, weight="bold")
+
+        # ---- top bar
+        bar = ctk.CTkFrame(self, fg_color="transparent")
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 6))
+        self.icon = tk.Canvas(bar, width=46, height=56, highlightthickness=0, cursor="hand2")
         self.icon.pack(side="left")
-        txt = ttk.Frame(bar)
+        self._icon_hover = False
+        self.icon.bind("<Enter>", lambda e: self._hover_icon(True))
+        self.icon.bind("<Leave>", lambda e: self._hover_icon(False))
+        self.icon.bind("<ButtonRelease-1>", lambda e: self.load_preamble())
+        if self.dnd:
+            self.icon.drop_target_register(DND_FILES)
+            self.icon.dnd_bind("<<DropEnter>>", lambda e: (self._hover_icon(True), e.action)[1])
+            self.icon.dnd_bind("<<DropLeave>>", lambda e: (self._hover_icon(False), e.action)[1])
+            self.icon.dnd_bind("<<Drop>>", self._on_drop)
+        txt = ctk.CTkFrame(bar, fg_color="transparent")
         txt.pack(side="left", padx=10)
-        ttk.Label(txt, text="Preamble", font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        self.icon_hint = ttk.Label(txt, text="click the icon to copy it", foreground="#666")
+        ctk.CTkLabel(txt, text="Preamble", font=bold, height=20).pack(anchor="w")
+        self.icon_hint_text = ("click to load a preamble file, or drop one here" if self.dnd
+                               else "click to load a preamble file")
+        self.icon_hint = ctk.CTkLabel(txt, text=self.icon_hint_text, text_color=MUTED, height=18)
         self.icon_hint.pack(anchor="w")
+
+        self.v_app = tk.StringVar()
+        ctk.CTkSegmentedButton(bar, values=APPEARANCES, variable=self.v_app,
+                               command=self._set_appearance).pack(side="right")
         self.v_top = tk.BooleanVar()
-        ttk.Checkbutton(bar, text="Always on top", variable=self.v_top,
-                        command=lambda: self.attributes("-topmost", self.v_top.get())).pack(side="right")
-        self.v_hist = tk.StringVar()
-        self.hist = ttk.Combobox(bar, textvariable=self.v_hist, state="readonly", width=34)
-        self.hist.pack(side="right", padx=14)
-        self.hist.bind("<<ComboboxSelected>>", self._pick_history)
-        ttk.Label(bar, text="History").pack(side="right")
+        ctk.CTkSwitch(bar, text="Always on top", variable=self.v_top,
+                      command=lambda: self.attributes("-topmost", self.v_top.get())).pack(side="right", padx=16)
+        self.v_hist = tk.StringVar(value="History")
+        self.hist = ctk.CTkOptionMenu(bar, variable=self.v_hist, values=["(empty)"], width=300,
+                                      dynamic_resizing=False, command=self._pick_history,
+                                      fg_color=("gray80", "gray25"), button_color=("gray72", "gray30"),
+                                      button_hover_color=("gray64", "gray36"), text_color=("gray10", "gray90"))
+        self.hist.pack(side="right")
 
-        paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=10)
-        left = ttk.Frame(paned, padding=(0, 0, 8, 0))
-        right = ttk.Frame(paned, padding=(8, 0, 0, 0))
-        paned.add(left, weight=1)
-        paned.add(right, weight=2)
+        # ---- left column
+        left = ctk.CTkFrame(self, fg_color="transparent")
+        left.grid(row=1, column=0, sticky="nsew", padx=(14, 7))
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(0, weight=1)
 
-        # equation editor
-        ef = ttk.LabelFrame(left, text="Equation  (math mode, no $...$)", padding=6)
-        ef.pack(fill="both", expand=True)
-        self.eq = tk.Text(ef, height=9, width=40, font=MONO, undo=True, wrap="none", relief="flat",
-                          highlightthickness=1, highlightbackground="#bbb", highlightcolor="#0f4c5c")
-        self.eq.pack(fill="both", expand=True)
+        ef = ctk.CTkFrame(left)
+        ef.grid(row=0, column=0, sticky="nsew")
+        ef.grid_columnconfigure(0, weight=1)
+        ef.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(ef, text="Equation", font=bold).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 0))
+        ctk.CTkLabel(ef, text="math mode, no $...$   ·   Ctrl+Enter copies", text_color=MUTED).grid(
+            row=0, column=0, sticky="e", padx=12, pady=(8, 0))
+        self.eq = ctk.CTkTextbox(ef, font=MONO, undo=True, wrap="none", border_width=1)
+        self.eq.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 10))
         self.eq.bind("<<Modified>>", self._on_modified)
         self.eq.bind("<Control-Return>", lambda e: (self.copy(), "break")[1])
         self.bind("<F5>", lambda e: self.refresh())
 
-        # style controls
-        sf = ttk.LabelFrame(left, text="Style  (overrides the preamble file)", padding=8)
-        sf.pack(fill="x", pady=(8, 0))
-        sf.columnconfigure(1, weight=1)
+        sf = ctk.CTkFrame(left)
+        sf.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        sf.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(sf, text="Style", font=bold).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 2))
+        ctk.CTkLabel(sf, text="use preamble", text_color=MUTED).grid(row=0, column=2, padx=12, pady=(8, 2))
         self.v_size, self.v_color, self.v_font = tk.StringVar(), tk.StringVar(), tk.StringVar()
         self.v_border, self.v_paste = tk.StringVar(), tk.StringVar()
         self.v_bold, self.v_inline = tk.BooleanVar(), tk.BooleanVar()
+        self.v_size_pre, self.v_color_pre, self.v_font_pre = tk.BooleanVar(), tk.BooleanVar(), tk.BooleanVar()
 
-        ttk.Label(sf, text="Font size").grid(row=0, column=0, sticky="w", pady=3)
-        r = ttk.Frame(sf)
-        r.grid(row=0, column=1, sticky="w")
-        self.e_size = ttk.Spinbox(r, from_=1, to=500, increment=1, width=7, textvariable=self.v_size)
-        self.e_size.pack(side="left")
-        ttk.Label(r, text="pt").pack(side="left", padx=4)
+        def row_label(r, text):
+            ctk.CTkLabel(sf, text=text).grid(row=r, column=0, sticky="w", padx=12, pady=4)
 
-        ttk.Label(sf, text="Colour").grid(row=1, column=0, sticky="w", pady=3)
-        r = ttk.Frame(sf)
+        def pre_box(r, var):
+            ctk.CTkCheckBox(sf, text="", variable=var, width=24, command=self._on_pre_toggle).grid(
+                row=r, column=2, padx=12)
+
+        row_label(1, "Font size")
+        r = ctk.CTkFrame(sf, fg_color="transparent")
         r.grid(row=1, column=1, sticky="w")
-        ttk.Label(r, text="#").pack(side="left")
-        self.e_color = ttk.Entry(r, width=9, textvariable=self.v_color)
+        self.e_size = ctk.CTkEntry(r, width=70, textvariable=self.v_size)
+        self.e_size.pack(side="left")
+        ctk.CTkLabel(r, text="pt").pack(side="left", padx=6)
+        pre_box(1, self.v_size_pre)
+
+        row_label(2, "Colour")
+        r = ctk.CTkFrame(sf, fg_color="transparent")
+        r.grid(row=2, column=1, sticky="w")
+        ctk.CTkLabel(r, text="#").pack(side="left", padx=(0, 3))
+        self.e_color = ctk.CTkEntry(r, width=90, textvariable=self.v_color)
         self.e_color.pack(side="left")
-        self.swatch = tk.Label(r, width=3, relief="solid", bd=1)
-        self.swatch.pack(side="left", padx=6)
-        self.swatch.bind("<Button-1>", lambda e: self._pick_color())
-        ttk.Button(r, text="Pick...", width=7, command=self._pick_color).pack(side="left")
+        self.swatch = ctk.CTkButton(r, text="", width=30, height=26, border_width=1, hover=False,
+                                    border_color=("gray50", "gray60"), command=self._pick_color)
+        self.swatch.pack(side="left", padx=8)
+        self.b_pick = ctk.CTkButton(r, text="Pick…", width=70, command=self._pick_color)
+        self.b_pick.pack(side="left")
+        pre_box(2, self.v_color_pre)
 
-        ttk.Label(sf, text="Font").grid(row=2, column=0, sticky="w", pady=3)
-        ttk.Combobox(sf, textvariable=self.v_font, values=list(FONT_LABELS.values()),
-                     state="readonly").grid(row=2, column=1, sticky="ew")
+        row_label(3, "Font")
+        self.o_font = ctk.CTkOptionMenu(sf, variable=self.v_font, values=list(FONT_LABELS.values()),
+                                        dynamic_resizing=False, command=lambda _: self._on_style())
+        self.o_font.grid(row=3, column=1, sticky="ew")
+        pre_box(3, self.v_font_pre)
 
-        ttk.Label(sf, text="Options").grid(row=3, column=0, sticky="w", pady=3)
-        r = ttk.Frame(sf)
-        r.grid(row=3, column=1, sticky="w")
-        ttk.Checkbutton(r, text="Bold", variable=self.v_bold).pack(side="left")
-        ttk.Checkbutton(r, text="Inline style", variable=self.v_inline).pack(side="left", padx=10)
-        ttk.Label(r, text="Border").pack(side="left", padx=(6, 3))
-        self.e_border = ttk.Spinbox(r, from_=0, to=50, increment=0.5, width=5, textvariable=self.v_border)
+        row_label(4, "Options")
+        r = ctk.CTkFrame(sf, fg_color="transparent")
+        r.grid(row=4, column=1, columnspan=2, sticky="w")
+        ctk.CTkCheckBox(r, text="Bold", variable=self.v_bold, width=70, command=self._on_style).pack(side="left")
+        ctk.CTkCheckBox(r, text="Inline style", variable=self.v_inline, width=110,
+                        command=self._on_style).pack(side="left", padx=(8, 14))
+        ctk.CTkLabel(r, text="Border").pack(side="left", padx=(0, 6))
+        self.e_border = ctk.CTkEntry(r, width=56, textvariable=self.v_border)
         self.e_border.pack(side="left")
-        ttk.Label(r, text="pt").pack(side="left", padx=3)
+        ctk.CTkLabel(r, text="pt").pack(side="left", padx=6)
 
-        ttk.Label(sf, text="Paste as").grid(row=4, column=0, sticky="w", pady=3)
-        ttk.Combobox(sf, textvariable=self.v_paste, values=list(PASTE_LABELS.values()),
-                     state="readonly").grid(row=4, column=1, sticky="ew")
-
-        for v in (self.v_size, self.v_color, self.v_font, self.v_border, self.v_bold, self.v_inline):
+        row_label(5, "Paste as")
+        ctk.CTkOptionMenu(sf, variable=self.v_paste, values=list(PASTE_LABELS.values()),
+                          dynamic_resizing=False).grid(row=5, column=1, columnspan=2, sticky="ew",
+                                                       padx=(0, 12), pady=(4, 12))
+        for v in (self.v_size, self.v_color, self.v_border):
             v.trace_add("write", lambda *_: self._on_style())
 
-        # actions
-        ab = ttk.Frame(left)
-        ab.pack(fill="x", pady=8)
-        self.btn_copy = ttk.Button(ab, text="Copy to clipboard   Ctrl+Enter", command=self.copy)
-        self.btn_copy.pack(side="left", fill="x", expand=True)
-        ttk.Button(ab, text="Output folder", command=lambda: (OUTDIR.mkdir(parents=True, exist_ok=True),
-                                                              open_path(OUTDIR))).pack(side="left", padx=(6, 0))
-        ttk.Button(ab, text="Edit preamble file", command=self.edit_preamble_file).pack(side="left", padx=(6, 0))
+        ab = ctk.CTkFrame(left, fg_color="transparent")
+        ab.grid(row=2, column=0, sticky="ew", pady=10)
+        ab.grid_columnconfigure(0, weight=1)
+        self.btn_copy = ctk.CTkButton(ab, text="Copy to clipboard", height=40, fg_color=ORANGE,
+                                      hover_color=ORANGE_HOVER, text_color="#1f1300",
+                                      font=ctk.CTkFont(size=15, weight="bold"), command=self.copy)
+        self.btn_copy.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(ab, text="Output folder", width=120, height=40,
+                      command=lambda: (OUTDIR.mkdir(parents=True, exist_ok=True), open_path(OUTDIR))
+                      ).grid(row=0, column=1, padx=(8, 0))
 
-        # right: tabs
-        nb = ttk.Notebook(right)
-        nb.pack(fill="both", expand=True)
-        pv = ttk.Frame(nb)
-        nb.add(pv, text="Preview")
-        tb = ttk.Frame(pv, padding=(6, 4))
-        tb.pack(fill="x")
-        ttk.Label(tb, text="Zoom").pack(side="left")
+        # ---- right column: tabs
+        tabs = ctk.CTkTabview(self, anchor="nw")
+        tabs.grid(row=1, column=1, sticky="nsew", padx=(7, 14), pady=(0, 10))
+        pv, pt, lg = tabs.add("Preview"), tabs.add("Preamble"), tabs.add("Log")
+
+        tb = ctk.CTkFrame(pv, fg_color="transparent")
+        tb.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(tb, text="Zoom").pack(side="left")
         self.v_zoom = tk.StringVar()
-        z = ttk.Combobox(tb, textvariable=self.v_zoom, values=ZOOMS, width=5, state="readonly")
-        z.pack(side="left", padx=4)
-        ttk.Label(tb, text="%   (preview only - the exported vector is size-independent)",
-                  foreground="#666").pack(side="left")
-        z.bind("<<ComboboxSelected>>", lambda e: self.refresh())
-        wrap = ttk.Frame(pv)
+        ctk.CTkOptionMenu(tb, variable=self.v_zoom, values=ZOOMS, width=90,
+                          command=lambda _: self.refresh()).pack(side="left", padx=8)
+        ctk.CTkLabel(tb, text="preview only - the exported vector is size-independent",
+                     text_color=MUTED).pack(side="left")
+        wrap = ctk.CTkFrame(pv, corner_radius=8)
         wrap.pack(fill="both", expand=True)
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(wrap, highlightthickness=0, bg="white")
-        xs = ttk.Scrollbar(wrap, orient="horizontal", command=self.canvas.xview)
-        ys = ttk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview)
+        xs = ctk.CTkScrollbar(wrap, orientation="horizontal", command=self.canvas.xview)
+        ys = ctk.CTkScrollbar(wrap, orientation="vertical", command=self.canvas.yview)
         self.canvas.configure(xscrollcommand=xs.set, yscrollcommand=ys.set)
-        xs.pack(side="bottom", fill="x")
-        ys.pack(side="right", fill="y")
-        self.canvas.pack(fill="both", expand=True)
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(6, 0))
+        ys.grid(row=0, column=1, sticky="ns")
+        xs.grid(row=1, column=0, sticky="ew")
         self.canvas.bind("<Configure>", lambda e: self._draw())
 
-        pt = ttk.Frame(nb)
-        nb.add(pt, text="Preamble")
-        self.pre_txt = tk.Text(pt, font=MONO, wrap="none", height=10, relief="flat", state="disabled")
-        self.pre_txt.pack(fill="both", expand=True, padx=4, pady=4)
-        self.pre_note = ttk.Label(pt, foreground="#666", wraplength=520, justify="left")
-        self.pre_note.pack(fill="x", padx=6, pady=(0, 6))
+        pb = ctk.CTkFrame(pt, fg_color="transparent")
+        pb.pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(pb, text="Copy preamble", width=130, command=self.copy_preamble).pack(side="left")
+        ctk.CTkButton(pb, text="Load file…", width=100, command=self.load_preamble).pack(side="left", padx=6)
+        ctk.CTkButton(pb, text="Edit file", width=90, command=self.edit_preamble_file).pack(side="left")
+        ctk.CTkButton(pb, text="Open folder", width=100,
+                      command=lambda: open_path(PREAMBLE_FILE.parent)).pack(side="left", padx=6)
+        self.pre_txt = ctk.CTkTextbox(pt, font=MONO, wrap="none", state="disabled")
+        self.pre_txt.pack(fill="both", expand=True)
+        self.pre_note = ctk.CTkLabel(pt, text="", text_color=MUTED, justify="left", anchor="w", wraplength=560)
+        self.pre_note.pack(fill="x", pady=(6, 0))
 
-        lg = ttk.Frame(nb)
-        nb.add(lg, text="Log")
-        self.log = tk.Text(lg, font=MONO, wrap="word", height=10, relief="flat", state="disabled")
-        self.log.pack(fill="both", expand=True, padx=4, pady=4)
+        self.log = ctk.CTkTextbox(lg, font=MONO, wrap="word", state="disabled")
+        self.log.pack(fill="both", expand=True)
 
-        self.status = ttk.Label(self, text="Ready", anchor="w", padding=(10, 4), relief="sunken")
-        self.status.pack(fill="x", side="bottom")
+        self.status = ctk.CTkLabel(self, text="Ready", anchor="w", height=26, corner_radius=0,
+                                   fg_color=("gray84", "gray18"), padx=14)
+        self.status.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self._recolor()
 
-    def _make_preamble_icon(self, parent) -> tk.Canvas:
-        """Document icon with a folded corner; click copies the personalised preamble."""
-        c = tk.Canvas(parent, width=46, height=56, highlightthickness=0, cursor="hand2")
-        self._draw_icon(c, hover=False)
-        c.bind("<Enter>", lambda e: self._draw_icon(c, True))
-        c.bind("<Leave>", lambda e: self._draw_icon(c, False))
-        c.bind("<ButtonRelease-1>", lambda e: self.copy_preamble())
-        if DND_TEXT:  # drag the preamble as text into any editor
-            try:
-                c.drag_source_register(1, DND_TEXT)
-                c.dnd_bind("<<DragInitCmd>>", lambda e: ("copy", DND_TEXT, self.preamble_text))
-                self.icon_hint_text = "click to copy, or drag it into your editor"
-            except Exception:
-                self.icon_hint_text = "click the icon to copy it"
-        return c
+    # ------------------------------------------------------------------ preamble icon
+    def _hover_icon(self, on: bool) -> None:
+        self._icon_hover = on
+        self._draw_icon()
 
-    @staticmethod
-    def _draw_icon(c: tk.Canvas, hover: bool) -> None:
+    def _draw_icon(self) -> None:
+        dark = ctk.get_appearance_mode() == "Dark"
+        c = self.icon
+        c.configure(bg=self._color(ctk.ThemeManager.theme["CTk"]["fg_color"]))
         c.delete("all")
-        fill, edge = ("#fb8b24", "#9a031e") if hover else ("#ffffff", "#0f4c5c")
+        if self._icon_hover:
+            fill, edge = ORANGE, "#9a031e"
+        else:
+            fill, edge = ("#2a3338", "#7fb3c2") if dark else ("#ffffff", "#0f4c5c")
         c.create_polygon(6, 4, 32, 4, 42, 14, 42, 52, 6, 52, fill=fill, outline=edge, width=2)
-        c.create_polygon(32, 4, 32, 14, 42, 14, fill="#d9d9d9", outline=edge, width=2)
+        c.create_polygon(32, 4, 32, 14, 42, 14, fill="#d9d9d9" if not dark else "#55636a", outline=edge, width=2)
         for i, w in enumerate((26, 20, 26, 14)):
             c.create_line(12, 24 + 7 * i, 12 + w, 24 + 7 * i, fill=edge, width=2)
         c.create_text(15, 16, text="\\", font=("Consolas", 12, "bold"), fill=edge)
 
+    def _color(self, pair) -> str:
+        if isinstance(pair, (list, tuple)):
+            return pair[1] if ctk.get_appearance_mode() == "Dark" else pair[0]
+        return pair
+
+    def _recolor(self) -> None:
+        """Plain tk widgets (and the Windows title bar) do not follow the theme by themselves."""
+        self._draw_icon()
+        self._draw()
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(self.wm_frame(), 16)
+                on = ctypes.c_int(1 if ctk.get_appearance_mode() == "Dark" else 0)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(on), 4)  # immersive dark
+                ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x27)   # redraw the frame
+            except (OSError, ValueError, AttributeError, tk.TclError):
+                pass
+
+    def _set_appearance(self, mode: str) -> None:
+        ctk.set_appearance_mode(mode)
+        self.after(50, self._recolor)
+
     # ------------------------------------------------------------------ state <-> UI
     def _load_into_ui(self) -> None:
         c = self.cfg
-        self.v_size.set(str(c["size"]))
+        self.v_size.set(str(c["size"]) if not str(c["size"]) == FROM_PREAMBLE else "10")
         self.v_color.set(c["color"])
         self.v_font.set(FONT_LABELS.get(c["font"], FONT_LABELS["cm"]))
+        self.v_size_pre.set(bool(c["size_pre"]))
+        self.v_color_pre.set(bool(c["color_pre"]))
+        self.v_font_pre.set(bool(c["font_pre"]))
         self.v_bold.set(bool(c["bold"]))
         self.v_inline.set(bool(c["inline"]))
         self.v_border.set(str(c["border"]))
         self.v_paste.set(PASTE_LABELS.get(c["paste"], PASTE_LABELS["object"]))
-        self.v_zoom.set(str(c["zoom"]))
+        self.v_zoom.set(c["zoom"] if c["zoom"] in ZOOMS else "200 %")
         self.v_top.set(bool(c["topmost"]))
+        self.v_app.set(c["appearance"] if c["appearance"] in APPEARANCES else "System")
         self.attributes("-topmost", self.v_top.get())
         self.eq.insert("1.0", c["eq"])
         self.eq.edit_reset()
         self.eq.edit_modified(False)
         self._refresh_history()
-        self.icon_hint.configure(text=getattr(self, "icon_hint_text", "click the icon to copy it"))
+        self._apply_pre_states()
 
     def _save_cfg(self) -> None:
         self.cfg.update(size=self.v_size.get(), color=self.v_color.get(),
-                        font=KEY_FROM_LABEL.get(self.v_font.get(), "cm"), bold=self.v_bold.get(),
-                        inline=self.v_inline.get(), border=self.v_border.get(),
+                        font=KEY_FROM_LABEL.get(self.v_font.get(), "cm"), size_pre=self.v_size_pre.get(),
+                        color_pre=self.v_color_pre.get(), font_pre=self.v_font_pre.get(),
+                        bold=self.v_bold.get(), inline=self.v_inline.get(), border=self.v_border.get(),
                         paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"), zoom=self.v_zoom.get(),
-                        topmost=self.v_top.get(), eq=self.equation(), geometry=self.geometry())
+                        topmost=self.v_top.get(), appearance=self.v_app.get(), eq=self.equation(),
+                        geometry=self.geometry())
         try:
             with open(CFG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.cfg, f, indent=1, ensure_ascii=False)
@@ -308,30 +434,34 @@ class App(_Base):
     def options(self) -> Options:
         """Read the style fields. Raises ValueError (and marks the offending field red)."""
         ok = {"size": True, "color": True, "border": True}
-        try:
-            size = float(self.v_size.get().replace(",", "."))
-            if size <= 0:
-                raise ValueError
-        except ValueError:
-            ok["size"] = False
-        try:
-            color = normalize_color(self.v_color.get())
-        except ValueError:
-            ok["color"] = False
+        size, color = FROM_PREAMBLE, FROM_PREAMBLE
+        if not self.v_size_pre.get():
+            try:
+                size = float(self.v_size.get().replace(",", "."))
+                if size <= 0:
+                    raise ValueError
+            except ValueError:
+                ok["size"] = False
+        if not self.v_color_pre.get():
+            try:
+                color = normalize_color(self.v_color.get())
+            except ValueError:
+                ok["color"] = False
         try:
             border = float(self.v_border.get().replace(",", "."))
             if border < 0:
                 raise ValueError
         except ValueError:
             ok["border"] = False
+        normal = ctk.ThemeManager.theme["CTkEntry"]["text_color"]
         for w, k in ((self.e_size, "size"), (self.e_color, "color"), (self.e_border, "border")):
-            w.configure(foreground="black" if ok[k] else "#c0392b")
+            w.configure(text_color=normal if ok[k] else RED)
         if not all(ok.values()):
             raise ValueError("invalid " + ", ".join(k for k, v in ok.items() if not v))
-        self.swatch.configure(bg="#" + color)
-        return Options(size=size, color=color, font=KEY_FROM_LABEL.get(self.v_font.get(), "cm"),
-                       bold=self.v_bold.get(), inline=self.v_inline.get(), border=border,
-                       paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"))
+        self.swatch.configure(fg_color=("#" + color) if color != FROM_PREAMBLE else ("gray75", "gray30"))
+        font = FROM_PREAMBLE if self.v_font_pre.get() else KEY_FROM_LABEL.get(self.v_font.get(), "cm")
+        return Options(size=size, color=color, font=font, bold=self.v_bold.get(), inline=self.v_inline.get(),
+                       border=border, paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"))
 
     # ------------------------------------------------------------------ events
     def _on_modified(self, _e=None) -> None:
@@ -342,6 +472,17 @@ class App(_Base):
     def _on_style(self) -> None:
         self.update_preamble()
         self.schedule()
+
+    def _on_pre_toggle(self) -> None:
+        self._apply_pre_states()
+        self._on_style()
+
+    def _apply_pre_states(self) -> None:
+        """Fields taken from the preamble are greyed out."""
+        for var, widgets in ((self.v_size_pre, (self.e_size,)), (self.v_color_pre, (self.e_color, self.b_pick)),
+                             (self.v_font_pre, (self.o_font,))):
+            for w in widgets:
+                w.configure(state="disabled" if var.get() else "normal")
 
     def _on_focus(self, e) -> None:
         if e.widget is self and self._mtime() != self._pre_mtime:   # preamble file was edited
@@ -362,19 +503,28 @@ class App(_Base):
         self._after = self.after(delay, self.refresh)
 
     def _pick_color(self) -> None:
-        init = "#" + (self.v_color.get().lstrip("#") if len(self.v_color.get().lstrip("#")) == 6 else "000000")
-        rgb, hexv = colorchooser.askcolor(color=init, parent=self, title="Equation colour")
+        if self.v_color_pre.get():
+            return
+        cur = self.v_color.get().lstrip("#")
+        rgb, hexv = colorchooser.askcolor(color="#" + (cur if len(cur) == 6 else "000000"),
+                                          parent=self, title="Equation colour")
         if hexv:
             self.v_color.set(hexv.lstrip("#").upper())
 
-    def _pick_history(self, _e=None) -> None:
-        i = self.hist.current()
-        if 0 <= i < len(self.cfg["history"]):
+    def _pick_history(self, choice: str) -> None:
+        labels = self._history_labels()
+        self.v_hist.set("History")
+        if choice in labels:
+            i = labels.index(choice)
             self.eq.delete("1.0", "end")
             self.eq.insert("1.0", self.cfg["history"][i])
 
+    def _history_labels(self) -> list[str]:
+        return [f"{i + 1:>2}  " + h.replace("\n", " ")[:60] for i, h in enumerate(self.cfg["history"])]
+
     def _refresh_history(self) -> None:
-        self.hist["values"] = [h.replace("\n", " ")[:70] for h in self.cfg["history"]]
+        self.hist.configure(values=self._history_labels() or ["(empty)"])
+        self.v_hist.set("History")
 
     # ------------------------------------------------------------------ preamble
     def update_preamble(self) -> None:
@@ -383,13 +533,21 @@ class App(_Base):
         except ValueError as e:
             self._set_text(self.pre_txt, f"% {e}")
             return
-        self.preamble_text = build_preamble(opts)
+        try:
+            self.preamble_text = build_preamble(opts)
+        except ValueError as e:
+            self._set_text(self.pre_txt, f"% {e}")
+            return
         self._set_text(self.pre_txt, self.preamble_text)
-        removed = strip_overrides(read_user_preamble())[1]
-        self.pre_note.configure(text=(
-            "Copied text has no \\documentclass, so it fits into any document.\n"
-            "Font, size and colour from the fields above replace those in your preamble file"
-            + (f" (replaced: {', '.join(removed)})." if removed else ".")))
+        from_pre = [n for n, v in (("font", self.v_font_pre), ("size", self.v_size_pre),
+                                   ("colour", self.v_color_pre)) if v.get()]
+        removed = strip_overrides(read_user_preamble(), font=not self.v_font_pre.get(),
+                                  size=not self.v_size_pre.get(), color=not self.v_color_pre.get())[1]
+        note = f"Preamble file: {PREAMBLE_FILE}\n"
+        note += (f"Taken from the preamble file: {', '.join(from_pre)}. " if from_pre else "")
+        note += ("Replaced by the window settings: " + ", ".join(removed) + "." if removed
+                 else "Nothing in the preamble file is overridden.")
+        self.pre_note.configure(text=note)
 
     def copy_preamble(self) -> None:
         try:
@@ -399,10 +557,37 @@ class App(_Base):
         self.clipboard_clear()
         self.clipboard_append(self.preamble_text)
         self.update()                       # keep the clipboard after the app closes
-        self.set_status("Preamble copied to the clipboard.")
-        self.icon_hint.configure(text="copied!", foreground="#0f4c5c")
-        self.after(1500, lambda: self.icon_hint.configure(
-            text=getattr(self, "icon_hint_text", "click the icon to copy it"), foreground="#666"))
+        self.set_status("Preamble copied to the clipboard (no \\documentclass - fits into any document).")
+
+    def load_preamble(self, path: str | None = None) -> None:
+        """Make a file the personal preamble (click: file dialog, or a file dropped on the icon)."""
+        if path is None:
+            path = filedialog.askopenfilename(
+                parent=self, title="Choose a preamble file",
+                initialdir=self.cfg.get("last_dir") or str(Path.home()),
+                filetypes=[("TeX files", "*.tex *.sty *.cls *.txt"), ("All files", "*.*")])
+            if not path:
+                return
+        try:
+            backup = install_preamble(path)
+        except (OSError, UnicodeError) as e:
+            return self.set_status(f"Could not load {path}: {e}", error=True)
+        self.cfg["last_dir"] = str(Path(path).parent)
+        self._pre_mtime = self._mtime()
+        self.update_preamble()
+        self.refresh()
+        msg = f"Loaded {Path(path).name} as preamble"
+        self.set_status(msg + (f" - previous one saved as {backup.name}." if backup else "."))
+        self._log(f"preamble <- {path}" + (f"\nbackup: {backup}" if backup else ""))
+        self.icon_hint.configure(text="loaded!", text_color=TEAL)
+        self.after(1800, lambda: self.icon_hint.configure(text=self.icon_hint_text, text_color=MUTED))
+
+    def _on_drop(self, e):
+        self._hover_icon(False)
+        files = [f for f in self.tk.splitlist(e.data) if os.path.isfile(f)]
+        if files:
+            self.load_preamble(files[0])
+        return e.action
 
     def edit_preamble_file(self) -> None:
         if not PREAMBLE_FILE.exists():
@@ -425,7 +610,8 @@ class App(_Base):
             self._draw()
             return self.set_status("Type an equation.")
         self.gen += 1
-        gen, dpi = self.gen, int(96 * int(self.v_zoom.get() or 200) / 100)
+        zoom = int((self.v_zoom.get() or "200").split()[0])
+        gen, dpi = self.gen, int(96 * zoom / 100)
         self._busy += 1
         self.set_status("Compiling...")
 
@@ -445,7 +631,7 @@ class App(_Base):
             opts = self.options()
         except ValueError as e:
             return self.set_status(str(e), error=True)
-        self.btn_copy.state(["disabled"])
+        self.btn_copy.configure(state="disabled")
         self.set_status("Building vector and copying...")
 
         def work() -> None:
@@ -459,6 +645,9 @@ class App(_Base):
         threading.Thread(target=work, daemon=True).start()
 
     def _poll(self) -> None:
+        if ctk.get_appearance_mode() != self._mode:          # e.g. Windows switched to dark
+            self._mode = ctk.get_appearance_mode()
+            self._recolor()
         try:
             while True:
                 kind, key, payload = self.q.get_nowait()
@@ -480,13 +669,13 @@ class App(_Base):
                         self.set_status("Preview up to date.")
                 elif kind == "copied":
                     path, mode, copied = payload
-                    self.btn_copy.state(["!disabled"])
+                    self.btn_copy.configure(state="normal")
                     self._add_history(key)
                     self.set_status(f"Copied as {mode} - press Ctrl+V in Affinity." if copied
                                     else f"Saved {path} (no clipboard support here).")
                     self._log(f"wrote {path}")
                 elif kind == "copy_error":
-                    self.btn_copy.state(["!disabled"])
+                    self.btn_copy.configure(state="normal")
                     self.set_status("Copy failed - see log.", error=True)
                     self._error = payload
                     self._log(payload)
@@ -499,15 +688,15 @@ class App(_Base):
     def _draw(self) -> None:
         c = self.canvas
         c.delete("all")
-        try:
-            dark = luminance(normalize_color(self.v_color.get())) > 0.7
+        try:   # light equation colour -> dark paper, otherwise white paper (independent of the theme)
+            dark = not self.v_color_pre.get() and luminance(normalize_color(self.v_color.get())) > 0.7
         except ValueError:
             dark = False
-        c.configure(bg="#2b2f33" if dark else "#ffffff")
+        c.configure(bg="#26292c" if dark else "#ffffff")
         w, h = max(c.winfo_width(), 50), max(c.winfo_height(), 50)
         if self._error:
-            c.create_text(12, 12, anchor="nw", text=self._error, fill="#e74c3c" if dark else "#c0392b",
-                          font=MONO, width=w - 24)
+            c.create_text(12, 12, anchor="nw", text=self._error, fill="#ff6b5b" if dark else "#c0392b",
+                          font=("Consolas", 11), width=w - 24)
             c.configure(scrollregion=(0, 0, w, h))
         elif self._img:
             iw, ih = self._img.width(), self._img.height()
@@ -523,7 +712,7 @@ class App(_Base):
         self._refresh_history()
 
     @staticmethod
-    def _set_text(widget: tk.Text, text: str) -> None:
+    def _set_text(widget, text: str) -> None:
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
@@ -536,20 +725,17 @@ class App(_Base):
         self.log.configure(state="disabled")
 
     def set_status(self, msg: str, error: bool = False) -> None:
-        self.status.configure(text=msg, foreground="#c0392b" if error else "black")
+        self.status.configure(text=msg, text_color=RED if error else ctk.ThemeManager.theme["CTkLabel"]["text_color"])
 
 
 def main() -> None:
-    if sys.platform == "win32":                      # crisp text on high-DPI screens
-        try:
+    if sys.platform == "win32":
+        try:   # process-wide ID (enough for python.org Python; the window ID covers Store Python)
             import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:  # noqa: BLE001
-            pass
-        try:                                         # own taskbar button + icon instead of python.exe's
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:  # noqa: BLE001
             pass
+    _theme()
     App().mainloop()
 
 

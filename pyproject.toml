@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "texclip"
-version = "0.3.0"
+version = "0.4.0"
 description = "Type LaTeX math, get a vector graphic you can paste into Affinity (or Inkscape, Illustrator, ...)."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Maximilian Goll" }]
-keywords = ["latex", "affinity", "svg", "equations", "vector", "tkinter"]
+keywords = ["latex", "affinity", "svg", "equations", "vector", "customtkinter"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
@@ -20,10 +20,12 @@ classifiers = [
   "Topic :: Multimedia :: Graphics",
   "Topic :: Scientific/Engineering",
 ]
-dependencies = []
+dependencies = [
+  "customtkinter>=5.2",     # modern widgets, light/dark theme
+  "tkinterdnd2>=0.4",       # drop a preamble file onto the preamble icon
+]
 
 [project.optional-dependencies]
-dnd = ["tkinterdnd2"]      # drag the preamble icon into other applications
 dev = ["pytest"]
 
 [project.scripts]
@@ -44,4 +46,5 @@ texclip = ["assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]           # test the checkout, not an installed copy
 markers = ["tex: needs latex + dvisvgm/dvipng on PATH"]

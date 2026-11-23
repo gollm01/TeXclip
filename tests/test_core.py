@@ -79,6 +79,48 @@ def test_make_tex_rejects_bad_input():
         make_tex("x", Options(color="red"), user_preamble="")
 
 
+# ---- "preamble" option: leave size / colour / font to the preamble file ---------------
+def test_strip_overrides_keeps_what_comes_from_the_preamble():
+    src = "\n".join([r"\usepackage{helvet,tikz}", r"\fontsize{24}{29}\selectfont", r"\Large",
+                     r"\color{red}"])
+    clean, removed = strip_overrides(src, font=False, size=False, color=False)
+    assert r"\usepackage{helvet,tikz}" in clean and not removed
+    # LaTeX resets the size at \begin{document}, so kept size lines are deferred
+    assert r"\AtBeginDocument{\fontsize{24}{29}\selectfont}" in clean
+    assert r"\AtBeginDocument{\Large}" in clean
+    assert r"\color{red}" in clean and "overridden" not in clean
+    clean, removed = strip_overrides(src, font=False, size=True, color=False)
+    assert "helvet" in clean and r"\Large" in removed and r"\color{red}" in clean
+
+
+def test_preamble_mode_in_build_preamble_and_make_tex():
+    user = r"\usepackage{newtxtext,newtxmath}" + "\n" + r"\color{blue}"
+    a = Options(font=core.FROM_PREAMBLE, size=core.FROM_PREAMBLE, color=core.FROM_PREAMBLE)
+    pre = build_preamble(a, user_preamble=user)
+    assert "newtxmath" in pre and r"\color{blue}" in pre
+    assert "amssymb" not in pre                          # newtxmath brings its own
+    assert "eqcolor" not in pre and "amsfonts" not in pre
+    tex = make_tex("x", a, user_preamble=user)
+    assert r"\fontsize" not in tex.split(r"\begin{document}")[1]
+    assert r"\color[HTML]" not in tex
+    # the window settings still win for whatever is not set to "preamble"
+    tex = make_tex("x", a.copy(size=14), user_preamble=user)
+    assert r"\fontsize{14}{16.8}\selectfont" in tex
+
+
+def test_install_preamble_strips_document_and_keeps_backup(tmp_path):
+    dest = tmp_path / "pre.tex"
+    dest.write_text("old", encoding="utf-8")
+    src = tmp_path / "mine.tex"
+    src.write_text("\\documentclass{article}\n\\usepackage{siunitx}\n\\begin{document}\nbody\n\\end{document}\n",
+                   encoding="utf-8")
+    backup = core.install_preamble(src, dest)
+    text = dest.read_text(encoding="utf-8")
+    assert r"\usepackage{siunitx}" in text
+    assert "documentclass" not in text and "body" not in text
+    assert backup and backup.read_text(encoding="utf-8") == "old"
+
+
 def test_all_fonts_known():
     for key in FONTS:
         assert build_preamble(Options(font=key), user_preamble="").strip()
@@ -100,6 +142,27 @@ def test_build_svg_has_paths_not_text(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
     svg = core.build(r"E=mc^2", Options()).read_text(encoding="utf-8")
     assert "<path" in svg and "<text" not in svg
+
+
+@needs_tex
+@pytest.mark.tex
+@pytest.mark.parametrize("font", list(FONTS))
+def test_every_font_gives_glyph_paths(font, tmp_path, monkeypatch):
+    """dvisvgm must find outlines for every font (CM Bright needed an extra font map)."""
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    svg = core.build(r"\alpha+x^2", Options(font=font)).read_text(encoding="utf-8")
+    assert svg.count("<path") >= 3
+
+
+@needs_tex
+@pytest.mark.tex
+def test_size_from_preamble_takes_effect(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    a = Options(size=core.FROM_PREAMBLE)
+    small = core.render_png("x", a, dpi=150, user_preamble="")
+    big = core.render_png("x", a, dpi=150, user_preamble=r"\fontsize{40}{48}\selectfont")
+    assert len(big) > len(small)
 
 
 @needs_tex

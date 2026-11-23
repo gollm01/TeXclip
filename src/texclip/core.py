@@ -34,14 +34,21 @@ FONTS = {  # key: (preamble, description)
 # newtx / newpx define the amssymb symbols themselves; loading amssymb as well fails (\Bbbk clash)
 NO_AMSSYMB = {"times", "palatino"}
 
+# user-preamble packages that bring their own amssymb symbols (font = "preamble")
+NO_AMSSYMB_PACKAGES = {"newtxmath", "newpxmath", "newtx", "newpx", "stix", "stix2", "libertinust1math"}
+# dvisvgm on MiKTeX finds the CM Bright outlines only through this map
+EXTRA_FONTMAPS = {"sans": "hfbright.map"}
+
 PASTE_MODES = ("object", "curves", "both")
+
+# value for size / color / font meaning "do not override, take it from the preamble file"
+FROM_PREAMBLE = "preamble"
 
 TEMPLATE = r"""\RequirePackage{{fix-cm}}
 \documentclass[border={bp}pt]{{standalone}}
 {preamble}
 \begin{{document}}
-\fontsize{{{size}}}{{{lead}}}\selectfont{bold}
-\color[HTML]{{{color}}}
+{style}
 {body}
 \end{{document}}
 """
@@ -65,15 +72,19 @@ FONT_PACKAGES = {
     "bookman", "charter", "mathdesign", "concmath", "cm-super",
 }
 # commands that fix size or colour; the "size"/"colour" settings replace them
-_OVERRIDE_CMD = re.compile(r"\\(?:color|pagecolor|normalcolor|fontsize)\b")
+_COLOR_CMD = re.compile(r"\\(?:color|pagecolor|normalcolor)\b")
+_SIZE_CMD = re.compile(r"\\fontsize\b")
 _SIZE_SWITCH = re.compile(r"^\s*\\(?:tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)\s*$")
 _USEPACKAGE = re.compile(r"\\usepackage(\[[^\]]*\])?\{([^}]*)\}")
 
 
 @dataclass
 class Options:
-    """Everything that shapes one rendering. Mirrors the CLI flags."""
-    size: float = 10.0          # font size in pt
+    """Everything that shapes one rendering. Mirrors the CLI flags.
+
+    ``size``, ``color`` and ``font`` may be ``"preamble"`` (FROM_PREAMBLE): then TeXclip does not
+    override that setting and whatever the preamble file says is used."""
+    size: float | str = 10.0    # font size in pt
     color: str = "000000"       # hex RRGGBB
     font: str = "cm"            # key of FONTS
     bold: bool = False          # \boldmath
@@ -85,6 +96,11 @@ class Options:
 
     def copy(self, **kw) -> "Options":
         return replace(self, **kw)
+
+
+def from_preamble(value) -> bool:
+    """True if a size / colour / font setting is left to the preamble file."""
+    return isinstance(value, str) and value.strip().lower() == FROM_PREAMBLE
 
 
 # --------------------------------------------------------------------------- helpers
@@ -126,19 +142,23 @@ def missing_tools(need=("latex", "dvisvgm")) -> list[str]:
 
 
 # --------------------------------------------------------------------------- preamble
-def strip_overrides(text: str) -> tuple[str, list[str]]:
+def strip_overrides(text: str, font: bool = True, size: bool = True,
+                    color: bool = True) -> tuple[str, list[str]]:
     """Neutralise font/size/colour settings in a user preamble.
 
-    The explicit font/size/colour options must win over whatever the personal preamble says.
-    Font packages are dropped from ``\\usepackage`` lists, and lines that set a colour or size
-    are commented out. Returns ``(clean_text, removed)``; ``removed`` lists what was dropped.
+    Settings chosen in TeXclip must win over whatever the personal preamble says. For every
+    category that is overridden (``font``/``size``/``color`` True), font packages are dropped
+    from ``\\usepackage`` lists and lines that set the size or colour are commented out.
+    Size lines that are *kept* are wrapped in ``\\AtBeginDocument`` because LaTeX resets the
+    size at ``\\begin{document}``. Returns ``(clean_text, removed)``.
     """
     removed: list[str] = []
 
     def fix_use(m: re.Match) -> str:
         opts, pkgs = m.group(1) or "", [p.strip() for p in m.group(2).split(",") if p.strip()]
-        keep = [p for p in pkgs if p not in FONT_PACKAGES]
-        removed.extend(p for p in pkgs if p in FONT_PACKAGES)
+        drop = [p for p in pkgs if p in FONT_PACKAGES] if font else []
+        keep = [p for p in pkgs if p not in drop]
+        removed.extend(drop)
         return f"\\usepackage{opts}{{{','.join(keep)}}}" if keep else ""
 
     out = []
@@ -146,12 +166,21 @@ def strip_overrides(text: str) -> tuple[str, list[str]]:
         m = re.search(r"(?<!\\)%", line)                    # split off an unescaped % comment
         code, comment = (line[:m.start()], line[m.start():]) if m else (line, "")
         new = _USEPACKAGE.sub(fix_use, code)
-        if _OVERRIDE_CMD.search(new) or _SIZE_SWITCH.match(new):
+        is_size = bool(_SIZE_CMD.search(new) or _SIZE_SWITCH.match(new))
+        is_color = bool(_COLOR_CMD.search(new))
+        if (is_size and size) or (is_color and color):
             removed.append(new.strip())
             out.append("% overridden by texclip settings: " + line.strip())
             continue
+        if is_size and "AtBeginDocument" not in new:
+            new = f"\\AtBeginDocument{{{new.strip()}}}"
         out.append((new + comment).rstrip())
     return "\n".join(out).strip(), removed
+
+
+def _loaded_packages(text: str) -> set[str]:
+    code = "\n".join(re.split(r"(?<!\\)%", l)[0] for l in text.splitlines())
+    return {p.strip() for m in _USEPACKAGE.finditer(code) for p in m.group(2).split(",")}
 
 
 def read_user_preamble(path: Path | None = None) -> str:
@@ -159,18 +188,46 @@ def read_user_preamble(path: Path | None = None) -> str:
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
+def install_preamble(src: str | Path, dest: Path | None = None) -> Path | None:
+    """Make ``src`` the personal preamble (copied over PREAMBLE_FILE).
+
+    A ``\\documentclass`` line and everything from ``\\begin{document}`` on are dropped, so a
+    complete .tex file works too. The previous preamble is kept as ``<name>.bak``; its path is
+    returned (None if there was none)."""
+    dest = dest or PREAMBLE_FILE
+    src = Path(src)
+    text = src.read_text(encoding="utf-8", errors="replace")
+    text = re.split(r"\\begin\{document\}", text)[0]
+    text = "\n".join(l for l in text.splitlines() if not re.match(r"\s*\\documentclass", l))
+    backup = None
+    if dest.exists():
+        if dest.resolve() == src.resolve():
+            return None
+        backup = dest.with_name(dest.name + ".bak")
+        shutil.copy2(dest, backup)
+    dest.write_text(f"% TeXclip preamble, loaded from {src.name}\n" + text.strip() + "\n", encoding="utf-8")
+    return backup
+
+
 def build_preamble(a: Options, user_preamble: str | None = None) -> str:
     """The personalised preamble: chosen font, base packages, user preamble (with overrides
     removed) and the helpers the size option needs. No \\documentclass, so it can be pasted
     into any document."""
     user = read_user_preamble() if user_preamble is None else user_preamble
-    user, _ = strip_overrides(user)
+    pf, ps, pc = from_preamble(a.font), from_preamble(a.size), from_preamble(a.color)
+    if not pf and a.font not in FONTS:
+        raise ValueError(f"unknown font {a.font!r}")
+    user, _ = strip_overrides(user, font=not pf, size=not ps, color=not pc)
+    no_amssymb = (a.font in NO_AMSSYMB) or (pf and _loaded_packages(user) & NO_AMSSYMB_PACKAGES)
+    size_txt = FROM_PREAMBLE if ps else f"{float(a.size):g}pt"
+    color_txt = FROM_PREAMBLE if pc else "#" + normalize_color(a.color)
     parts = [
-        f"% --- texclip preamble: font={a.font}, size={a.size:g}pt, colour=#{normalize_color(a.color)}",
-        FONTS[a.font][0],
-        BASE_PREAMBLE.replace("amssymb,", "") if a.font in NO_AMSSYMB else BASE_PREAMBLE,
+        f"% --- texclip preamble: font={a.font}, size={size_txt}, colour={color_txt}",
+        "" if pf else FONTS[a.font][0],
+        BASE_PREAMBLE.replace("amssymb,", "") if no_amssymb else BASE_PREAMBLE,
         user,
         r"\usepackage{bm,anyfontsize}",
+        "" if pc else
         f"\\definecolor{{eqcolor}}{{HTML}}{{{normalize_color(a.color)}}}   % use as \\color{{eqcolor}}",
     ]
     return "\n".join(p for p in parts if p)
@@ -193,16 +250,28 @@ def make_body(eq: str, inline: bool = False) -> str:
 
 
 def make_tex(eq: str, a: Options, user_preamble: str | None = None) -> str:
-    size = float(a.size)
-    if size <= 0:
-        raise ValueError("size must be positive")
-    return TEMPLATE.format(
-        bp=a.border, preamble=build_preamble(a, user_preamble), size=f"{size:g}",
-        lead=f"{round(size * 1.2, 2):g}", bold=r"\boldmath" if a.bold else "",
-        color=normalize_color(a.color), body=make_body(eq, a.inline))
+    style = ""
+    if not from_preamble(a.size):
+        size = float(a.size)
+        if size <= 0:
+            raise ValueError("size must be positive")
+        style += f"\\fontsize{{{size:g}}}{{{round(size * 1.2, 2):g}}}\\selectfont"
+    if a.bold:
+        style += r"\boldmath"
+    if not from_preamble(a.color):
+        style += f"\n\\color[HTML]{{{normalize_color(a.color)}}}"
+    return TEMPLATE.format(bp=a.border, preamble=build_preamble(a, user_preamble),
+                           style=style.strip("\n"), body=make_body(eq, a.inline))
 
 
 # --------------------------------------------------------------------------- building
+def _tmpdir():
+    """Scratch folder; a compile still running when the app closes must not raise on cleanup."""
+    if sys.version_info >= (3, 10):
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    return tempfile.TemporaryDirectory()
+
+
 def _compile_dvi(tex: str, tmp: str) -> None:
     (Path(tmp) / "eq.tex").write_text(tex, encoding="utf-8")
     try:
@@ -216,14 +285,23 @@ def build(eq: str, a: Options, name: str | None = None) -> Path:
     tex = make_tex(eq, a)
     OUTDIR.mkdir(parents=True, exist_ok=True)
     name = name or "eq_" + hashlib.sha1(tex.encode()).hexdigest()[:8]
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmpdir() as tmp:
         (OUTDIR / f"{name}.tex").write_text(eq + "\n", encoding="utf-8")  # source for later edits
         if a.format == "svg":
             _compile_dvi(tex, tmp)       # DVI -> SVG: glyphs as paths, no Ghostscript needed
             if not shutil.which("dvisvgm"):
                 raise RuntimeError("dvisvgm not found (install it via the MiKTeX Console)")
             out = OUTDIR / f"{name}.svg"
-            run(["dvisvgm", "--no-fonts", "--exact-bbox", "-o", str(out), "eq.dvi"], tmp)
+            cmd = ["dvisvgm", "--no-fonts", "--exact-bbox", "-o", str(out), "eq.dvi"]
+            if a.font in EXTRA_FONTMAPS:
+                cmd.insert(1, f"--fontmap=+{EXTRA_FONTMAPS[a.font]}")
+            r = run(cmd, tmp)
+            # a font without outlines gives an SVG with missing glyphs - fail loudly instead
+            bad = [l.strip() for l in (r.stdout + r.stderr).splitlines()
+                   if "failed to create" in l or ("font" in l and "not found" in l and "map" not in l)]
+            if bad:
+                out.unlink(missing_ok=True)
+                raise RuntimeError("dvisvgm could not find glyph outlines for this font:\n" + "\n".join(bad))
             return out
         (Path(tmp) / "eq.tex").write_text(tex, encoding="utf-8")
         try:
@@ -249,7 +327,7 @@ def render_png(eq: str, a: Options, dpi: int = 200, user_preamble: str | None = 
     if not shutil.which("dvipng"):
         raise RuntimeError("dvipng not found (install it via the MiKTeX Console); preview disabled")
     tex = make_tex(eq, a, user_preamble)
-    with tempfile.TemporaryDirectory() as tmp:
+    with _tmpdir() as tmp:
         _compile_dvi(tex, tmp)
         run(["dvipng", "-T", "tight", "-D", str(dpi), "-bg", "Transparent", "-q*",
              "-o", "eq.png", "eq.dvi"], tmp)
