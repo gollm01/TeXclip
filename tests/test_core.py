@@ -176,6 +176,101 @@ def test_affinity_clipboard_formats():
     assert core.PASTE_MODES == ("object", "curves")
 
 
+# ---- anchor / baseline shift --------------------------------------------------------------
+def test_make_tex_measures_the_box():
+    tex = make_tex("x", Options(), user_preamble="")
+    assert r"\newsavebox\texclipbox" in tex and "TEXCLIP-DIMS" in tex
+    assert r"\usebox\texclipbox" in tex                    # baseline: the measured box is shipped
+    ink = make_tex("x", Options(anchor="ink"), user_preamble="")
+    assert r"\usebox" not in ink and r"$\displaystyle x$" in ink.split("TEXCLIP-DIMS")[1]
+
+
+def test_baseline_shift_arithmetic():
+    d = core.Dims(ht=8.64, dp=0.0, wd=9.0)
+    assert core.baseline_shift(d, Options()) == -0.5            # -(0 + 0.5) * 72/72.27
+    assert core.baseline_shift(core.Dims(18.0, 8.5833, 20.0), Options()) == -9.05
+    assert core.baseline_shift(d, Options(border=0)) == 0.0
+    assert core.baseline_shift(d, Options(anchor="ink")) is None
+    assert core.baseline_shift(d, Options(anchor="baseline-crop")) == 0.0
+
+
+def test_crop_at_baseline():
+    svg = "<svg width='10pt' height='12pt' viewBox='-72 -72 10 12'><g/></svg>"
+    out = core.crop_at_baseline(svg, core.Dims(ht=9, dp=2.5, wd=8), border=0.5)
+    cut = 3.0 * 72 / 72.27
+    assert f"viewBox='-72 -72 10 {12 - cut:g}'" in out
+    assert f"height='{12 - cut:g}pt'" in out and "overflow='visible'" in out
+
+
+LEGACY_TEMPLATE = r"""\RequirePackage{{fix-cm}}
+\documentclass[border={bp}pt]{{standalone}}
+{preamble}
+\begin{{document}}
+{style}
+{body}
+\end{{document}}
+"""
+
+
+@needs_tex
+@pytest.mark.tex
+@pytest.mark.parametrize("eq", ["x^2", "t_g", r"\frac{a}{b}", r"i\hbar\,\partial_t\ket{\psi}=\hat H\ket{\psi}"])
+def test_anchor_ink_matches_the_old_output(eq, tmp_path, monkeypatch):
+    """--anchor ink: same box and same glyph positions as before the anchor feature
+    (dvisvgm's glyph ids are not stable between runs, so the files are compared by geometry)."""
+    import re
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    a = Options(size=30, anchor="ink")
+    new = core.build(eq, a).read_text(encoding="utf-8")
+    # the old pipeline, by hand
+    style = r"\fontsize{30}{36}\selectfont" + "\n" + r"\color[HTML]{000000}"
+    old_tex = LEGACY_TEMPLATE.format(bp=a.border, preamble=build_preamble(a, ""), style=style,
+                                     body=make_body(eq))
+    (tmp_path / "eq.tex").write_text(old_tex, encoding="utf-8")
+    core.run(["latex", "-interaction=nonstopmode", "eq.tex"], str(tmp_path))
+    core.run(["dvisvgm", "--no-fonts", "--exact-bbox", "-o", "old.svg", "eq.dvi"], str(tmp_path))
+    old = (tmp_path / "old.svg").read_text(encoding="utf-8")
+    root = lambda s: re.search(r"<svg[^>]*>", s).group(0)
+    uses = lambda s: sorted(re.findall(r"<use x='([^']+)' y='([^']+)'", s))
+    rects = lambda s: sorted(re.findall(r"<rect [^>]*>", s))
+    assert root(new) == root(old)
+    assert uses(new) == uses(old) and rects(new) == rects(old)
+
+
+@needs_tex
+@pytest.mark.tex
+def test_baseline_anchor_dims_and_shift(tmp_path, monkeypatch):
+    import re
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    x2 = core.build_result("x^2", Options())
+    assert x2.dims.dp == 0 and x2.shift == -0.5                 # spec test 1
+    tg = core.build_result("t_g", Options(size=30))
+    assert tg.dims.dp > 0 and tg.shift < -0.5                   # spec test 2
+    fr = core.build_result(r"\frac{a}{b}", Options(size=30))
+    assert fr.shift < tg.shift                                  # spec test 3: larger shift
+    al = core.build_result(r"\begin{align*} a&=b\\ c&=d \end{align*}", Options())
+    assert al.dims.dp > 0 and al.shift is not None              # spec test 4
+    # the SVG box is exactly the TeX box + border (in bp)
+    vb = [float(v) for v in re.search(r"viewBox='([^']+)'", tg.path.read_text(encoding="utf-8")).group(1).split()]
+    assert abs(vb[3] - (tg.dims.ht + tg.dims.dp + 2 * 0.5) * 72 / 72.27) < 0.01
+    crop = core.build_result("t_g", Options(size=30, anchor="baseline-crop"))
+    svg = crop.path.read_text(encoding="utf-8")
+    vb = [float(v) for v in re.search(r"viewBox='([^']+)'", svg).group(1).split()]
+    assert "overflow='visible'" in svg and abs(vb[3] - (tg.dims.ht + 0.5) * 72 / 72.27) < 0.01
+
+
+@needs_tex
+@pytest.mark.tex
+def test_latex_error_writes_no_svg(tmp_path, monkeypatch):           # spec test 5
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    with pytest.raises(RuntimeError, match="Undefined control sequence"):
+        core.build_result(r"\nosuchmacro", Options())
+    assert not list(tmp_path.glob("*.svg"))
+
+
 @needs_tex
 @pytest.mark.tex
 def test_size_from_preamble_takes_effect(monkeypatch, tmp_path):

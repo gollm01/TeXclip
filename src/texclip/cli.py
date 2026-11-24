@@ -6,18 +6,21 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .core import (FONTS, FROM_PREAMBLE, PASTE_MODES, Options, build, from_preamble, missing_tools,
-                   normalize_color, to_clipboard)
+from .core import (ANCHORS, FONTS, FROM_PREAMBLE, PASTE_MODES, Options, build_result, from_preamble,
+                   missing_tools, normalize_color, to_clipboard)
 
 
 def handle(eq: str, a: Options, name: str | None = None) -> bool:
     try:
-        out = build(eq, a, name)
+        res = build_result(eq, a, name)
     except (RuntimeError, ValueError) as e:
         print(e, file=sys.stderr)
         return False
+    out = res.path
     clip = (not a.no_clip) and to_clipboard(out, a.paste)
     print(f"{out}" + (f"   [copied as {a.paste} -> Ctrl+V in Affinity]" if clip else ""))
+    if res.shift is not None:
+        print(f"baseline shift: {res.shift:.2f} pt")
     return True
 
 
@@ -38,6 +41,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="object = the equation as one curve (default), curves = one curve per glyph")
     p.add_argument("--format", default="svg", choices=["svg", "pdf"], help="default svg")
     p.add_argument("--border", type=float, default=0.5, help="padding in pt")
+    p.add_argument("--anchor", default="baseline", choices=ANCHORS,
+                   help="box bottom: baseline = TeX box, prints the baseline shift for Affinity "
+                        "(default); ink = lowest ink; baseline-crop = box ends at the baseline (experimental)")
     p.add_argument("--no-clip", action="store_true", help="only write the file")
     p.add_argument("--fonts", action="store_true", help="list font styles and exit")
     p.add_argument("--shortcut", action="store_true", help="create a desktop shortcut with the TeXclip icon and exit")
@@ -61,7 +67,8 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as e:
         p.error(str(e))
     a = Options(size=size, color=color, font=args.font, bold=args.bold, inline=args.inline,
-                border=args.border, paste=args.paste, format=args.format, no_clip=args.no_clip)
+                border=args.border, paste=args.paste, format=args.format, no_clip=args.no_clip,
+                anchor=args.anchor)
 
     if miss := missing_tools(("latex", "dvisvgm") if a.format == "svg" else ("pdflatex",)):
         sys.exit(f"missing on PATH: {', '.join(miss)} - install a TeX distribution (MiKTeX / TeX Live)")

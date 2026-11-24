@@ -44,14 +44,30 @@ PASTE_MODES = ("object", "curves")
 # value for size / color / font meaning "do not override, take it from the preamble file"
 FROM_PREAMBLE = "preamble"
 
+# Where the bottom of the SVG box lies (Affinity puts it on the text baseline when the equation
+# is pasted into a text frame):
+#   ink            lowest ink, e.g. the g of t_g (dvisvgm --exact-bbox) - the original behaviour
+#   baseline       the TeX box + border (--bbox=papersize); TeXclip reports the baseline shift
+#   baseline-crop  experimental: TeX box, cut off at the math baseline, overflow="visible"
+ANCHORS = ("baseline", "ink", "baseline-crop")
+TEX_PT_TO_BP = 72 / 72.27
+
+# The math is set in a box first so its height/depth/width can be written to the log.
 TEMPLATE = r"""\RequirePackage{{fix-cm}}
 \documentclass[border={bp}pt]{{standalone}}
 {preamble}
+\newsavebox\texclipbox
 \begin{{document}}
 {style}
-{body}
+\sbox\texclipbox{{{body}}}%
+\typeout{{TEXCLIP-DIMS: ht=\the\ht\texclipbox; dp=\the\dp\texclipbox; wd=\the\wd\texclipbox}}%
+{output}
 \end{{document}}
 """
+# baseline modes ship the measured box; "ink" typesets the math directly as before, so its SVG
+# stays byte-identical to earlier versions (the box is then only used for measuring)
+_OUTPUT = {"ink": "{body}", "default": r"\usebox\texclipbox"}
+_DIMS = re.compile(r"TEXCLIP-DIMS: ht=([-\d.]+)pt; dp=([-\d.]+)pt; wd=([-\d.]+)pt")
 
 OUTDIR = Path(os.environ.get("TEXCLIP_DIR", Path.home() / "texclip"))
 
@@ -93,9 +109,37 @@ class Options:
     paste: str = "object"       # object (one compound path) | curves (one path per glyph)
     format: str = "svg"         # svg | pdf
     no_clip: bool = False       # only write the file
+    anchor: str = "baseline"    # baseline | ink | baseline-crop  (see ANCHORS)
 
     def copy(self, **kw) -> "Options":
         return replace(self, **kw)
+
+
+@dataclass
+class Dims:
+    """Size of the typeset math in TeX pt (from the TEXCLIP-DIMS log line)."""
+    ht: float
+    dp: float
+    wd: float
+
+
+@dataclass
+class BuildResult:
+    path: Path
+    dims: Dims | None
+    shift: float | None         # baseline shift for Affinity in pt (None for anchor "ink")
+
+
+def baseline_shift(dims: Dims | None, a: Options) -> float | None:
+    """Affinity puts the bottom of the pasted box on the text baseline; the box bottom lies
+    dp + border below the math baseline, so the equation has to move down by that much
+    (TeX pt -> Affinity pt = bp). None for anchor "ink" (no reference point)."""
+    if dims is None or a.anchor == "ink":
+        return None
+    if a.anchor == "baseline-crop":
+        return 0.0
+    v = round(-(dims.dp + float(a.border)) * TEX_PT_TO_BP, 2)
+    return 0.0 if v == 0 else v
 
 
 def from_preamble(value) -> bool:
@@ -260,8 +304,10 @@ def make_tex(eq: str, a: Options, user_preamble: str | None = None) -> str:
         style += r"\boldmath"
     if not from_preamble(a.color):
         style += f"\n\\color[HTML]{{{normalize_color(a.color)}}}"
+    body = make_body(eq, a.inline)
+    output = _OUTPUT["ink"].format(body=body) if a.anchor == "ink" else _OUTPUT["default"]
     return TEMPLATE.format(bp=a.border, preamble=build_preamble(a, user_preamble),
-                           style=style.strip("\n"), body=make_body(eq, a.inline))
+                           style=style.strip("\n"), body=body, output=output)
 
 
 # --------------------------------------------------------------------------- building
@@ -272,27 +318,63 @@ def _tmpdir():
     return tempfile.TemporaryDirectory()
 
 
-def _compile_dvi(tex: str, tmp: str) -> None:
+def read_dims(tmp: str) -> Dims | None:
+    """The TEXCLIP-DIMS line of eq.log (None if missing, e.g. for a hand-made template)."""
+    try:
+        m = _DIMS.search((Path(tmp) / "eq.log").read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return None
+    return Dims(*(float(v) for v in m.groups())) if m else None
+
+
+def _compile_dvi(tex: str, tmp: str) -> Dims | None:
     (Path(tmp) / "eq.tex").write_text(tex, encoding="utf-8")
     try:
         run(["latex", "-interaction=nonstopmode", "-halt-on-error", "eq.tex"], tmp)
     except RuntimeError as e:
         raise RuntimeError("LaTeX error:\n" + latex_error(str(e))) from None
+    return read_dims(tmp)
+
+
+def crop_at_baseline(svg: str, dims: Dims, border: float) -> str:
+    """Anchor "baseline-crop": shorten the SVG box so it ends at the math baseline; what lies
+    below (descenders, subscripts) stays visible through overflow="visible"."""
+    cut = (dims.dp + border) * TEX_PT_TO_BP
+    m = re.search(r"<svg\b[^>]*>", svg)
+    head = m.group(0)
+    vb = re.search(r"viewBox=(['\"])([^'\"]+)\1", head)
+    x, y, w, h = (float(v) for v in vb.group(2).split())
+    new = head.replace(vb.group(0), f"viewBox='{x:g} {y:g} {w:g} {max(h - cut, 0.001):g}'")
+    hm = re.search(r"height=(['\"])([\d.]+)pt\1", new)
+    if hm:
+        new = new.replace(hm.group(0), f"height='{max(float(hm.group(2)) - cut, 0.001):g}pt'")
+    if "overflow" not in new:
+        new = new[:-1] + " overflow='visible'>"         # the root <svg ...> tag ends with '>'
+    return svg.replace(head, new, 1)
 
 
 def build(eq: str, a: Options, name: str | None = None) -> Path:
     """Compile ``eq`` and write ``<name>.svg|pdf`` (+ ``<name>.tex``) to OUTDIR."""
+    return build_result(eq, a, name).path
+
+
+def build_result(eq: str, a: Options, name: str | None = None) -> BuildResult:
+    """Like build(), plus the TeX dimensions and the baseline shift for Affinity."""
+    if a.anchor not in ANCHORS:
+        raise ValueError(f"anchor must be one of {', '.join(ANCHORS)}")
     tex = make_tex(eq, a)
     OUTDIR.mkdir(parents=True, exist_ok=True)
     name = name or "eq_" + hashlib.sha1(tex.encode()).hexdigest()[:8]
     with _tmpdir() as tmp:
         (OUTDIR / f"{name}.tex").write_text(eq + "\n", encoding="utf-8")  # source for later edits
         if a.format == "svg":
-            _compile_dvi(tex, tmp)       # DVI -> SVG: glyphs as paths, no Ghostscript needed
+            dims = _compile_dvi(tex, tmp)  # DVI -> SVG: glyphs as paths, no Ghostscript needed
             if not shutil.which("dvisvgm"):
                 raise RuntimeError("dvisvgm not found (install it via the MiKTeX Console)")
             out = OUTDIR / f"{name}.svg"
-            cmd = ["dvisvgm", "--no-fonts", "--exact-bbox", "-o", str(out), "eq.dvi"]
+            # ink: box = lowest/highest ink; baseline: box = TeX box + border (standalone's papersize)
+            bbox = "--exact-bbox" if a.anchor == "ink" else "--bbox=papersize"
+            cmd = ["dvisvgm", "--no-fonts", bbox, "-o", str(out), "eq.dvi"]
             if a.font in EXTRA_FONTMAPS:
                 cmd.insert(1, f"--fontmap=+{EXTRA_FONTMAPS[a.font]}")
             r = run(cmd, tmp)
@@ -302,12 +384,16 @@ def build(eq: str, a: Options, name: str | None = None) -> Path:
             if bad:
                 out.unlink(missing_ok=True)
                 raise RuntimeError("dvisvgm could not find glyph outlines for this font:\n" + "\n".join(bad))
-            return out
+            if a.anchor == "baseline-crop" and dims:
+                out.write_text(crop_at_baseline(out.read_text(encoding="utf-8"), dims, float(a.border)),
+                               encoding="utf-8")
+            return BuildResult(out, dims, baseline_shift(dims, a))
         (Path(tmp) / "eq.tex").write_text(tex, encoding="utf-8")
         try:
             run(["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "eq.tex"], tmp)
         except RuntimeError as e:
             raise RuntimeError("LaTeX error:\n" + latex_error(str(e))) from None
+        dims = read_dims(tmp)
         pdf = Path(tmp) / "eq.pdf"
         gs = next((shutil.which(g) for g in ("gs", "gswin64c", "gswin32c", "mgs") if shutil.which(g)), None)
         if gs:   # outline glyphs so Affinity does not substitute fonts
@@ -319,19 +405,27 @@ def build(eq: str, a: Options, name: str | None = None) -> Path:
             print("warning: Ghostscript not found - PDF keeps fonts; use SVG instead", file=sys.stderr)
         out = OUTDIR / f"{name}.pdf"
         shutil.copy(pdf, out)
-        return out
+        # a PDF page is always the TeX box + border, so the shift is the same as for "baseline"
+        return BuildResult(out, dims, baseline_shift(dims, a.copy(anchor="baseline")
+                                                     if a.anchor != "ink" else a))
 
 
-def render_png(eq: str, a: Options, dpi: int = 200, user_preamble: str | None = None) -> bytes:
-    """Fast raster preview (latex -> dvipng, transparent background). Returns PNG bytes."""
+def render_preview(eq: str, a: Options, dpi: int = 200,
+                   user_preamble: str | None = None) -> tuple[bytes, Dims | None]:
+    """Fast raster preview (latex -> dvipng, transparent background) plus the TeX dimensions."""
     if not shutil.which("dvipng"):
         raise RuntimeError("dvipng not found (install it via the MiKTeX Console); preview disabled")
     tex = make_tex(eq, a, user_preamble)
     with _tmpdir() as tmp:
-        _compile_dvi(tex, tmp)
+        dims = _compile_dvi(tex, tmp)
         run(["dvipng", "-T", "tight", "-D", str(dpi), "-bg", "Transparent", "-q*",
              "-o", "eq.png", "eq.dvi"], tmp)
-        return (Path(tmp) / "eq.png").read_bytes()
+        return (Path(tmp) / "eq.png").read_bytes(), dims
+
+
+def render_png(eq: str, a: Options, dpi: int = 200, user_preamble: str | None = None) -> bytes:
+    """Fast raster preview (latex -> dvipng, transparent background). Returns PNG bytes."""
+    return render_preview(eq, a, dpi, user_preamble)[0]
 
 
 # --------------------------------------------------------------------------- clipboard
@@ -515,8 +609,9 @@ def flatten_svg(svg_text: str, merge: bool = True) -> str:
         paths = [f'<path d="{" ".join(ds)}" fill="{col}"/>' for col, ds in by_color.items()]
     else:
         paths = [f'<path d="{d}" fill="{col}"/>' for col, d in pieces]
+    overflow = f' overflow="{root.get("overflow")}"' if root.get("overflow") else ""
     head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{root.get("width")}" '
-            f'height="{root.get("height")}" viewBox="{root.get("viewBox")}">')
+            f'height="{root.get("height")}" viewBox="{root.get("viewBox")}"{overflow}>')
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + head + "\n" + "\n".join(paths) + "\n</svg>\n"
 
 

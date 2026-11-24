@@ -27,6 +27,8 @@ a crisp, infinitely scalable equation. The SVG also works in Inkscape, Illustrat
   equations you paste.
 - **Modern interface** (customtkinter) with a **light, dark or system** theme.
 - **Two paste modes:** one scalable object, or curves with every glyph individually editable.
+- **Baseline anchor for equations inside text:** TeXclip measures the TeX depth and shows the
+  baseline shift to enter in Affinity's Character panel (see *Anchor* below).
 - Equation history, remembers your settings, "always on top" so it can float next to Affinity.
 - Also a **command-line tool** for scripts and batch conversion.
 
@@ -108,6 +110,36 @@ On Windows, the SVG goes on the clipboard under the format names Affinity reads:
 `image/svg+xml` is added for other programs. Glyph references are resolved into plain paths first.
 If pasting fails, drag the `.svg` from the output folder onto the canvas or use *File > Place*.
 
+### Equations inside text: the Anchor option
+
+When a text cursor is active in Affinity, Ctrl+V inserts the equation as an inline object.
+Affinity puts the **bottom edge of the SVG box on the text baseline**. The *Anchor* setting
+decides where that bottom edge is:
+
+| Anchor | Bottom of the box | Result |
+|---|---|---|
+| **baseline** (default) | the TeX box plus the border: `dp` + border below the math baseline | TeXclip shows the **baseline shift**. With that shift applied, the math baseline sits on the text baseline. |
+| **ink** | the lowest ink, e.g. the `g` of `t_g` | the original behaviour. Equations with depth (subscripts, descenders, fractions) sit too high. |
+| **baseline-crop** (experimental) | the math baseline. The box is cut there and `overflow="visible"` is set. | no shift needed, if Affinity draws the part below the box. It may clip subscripts. |
+
+TeX measures the height, depth and width of the math (`\sbox` + `\typeout` into the log). In
+*baseline* mode `dvisvgm --bbox=papersize` makes the SVG box exactly the TeX box plus the border.
+The shift is `-(dp + border) * 72/72.27` pt, i.e. TeX pt converted to Affinity pt. Multi-line
+environments (`align`, `gather` …) get a vertically centred baseline from TeX, as usual.
+
+Workflow for an equation inside a text frame:
+
+1. Copy the equation in TeXclip. The line *Baseline shift: −3.47 pt* appears under the preview.
+2. In Affinity, place the text cursor and press **Ctrl+V**.
+3. Back in TeXclip, click **Copy value**. Only the number goes to the clipboard, replacing the
+   equation, which is why you paste the equation first.
+4. In Affinity, select the pasted equation like a character (Shift+Arrow), open the
+   **Character panel**, and paste into **Baseline shift**.
+
+The value is only correct if the equation is pasted at **100 %**. Scaling the pasted object
+scales the needed shift too. The shift is stored in the history, so re-copying an old equation
+shows its value again. The CLI prints it as `baseline shift: -3.47 pt` after the output path.
+
 ## Command line
 
 ```powershell
@@ -118,6 +150,8 @@ texclip -f equations.txt          # one equation per line -> files only
 texclip -i -s 12 --font palatino  # interactive loop
 texclip --fonts                   # list the font styles
 texclip -s preamble --font preamble 'x^2'   # size and font from the preamble file
+texclip -s 30 't_g'                         # prints: baseline shift: -9.05 pt
+texclip --anchor ink 't_g'                  # old behaviour: box ends at the lowest ink
 ```
 
 In PowerShell use single quotes (`cmd.exe` treats `^` as an escape character).

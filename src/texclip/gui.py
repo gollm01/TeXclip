@@ -25,8 +25,9 @@ except ImportError:  # pragma: no cover - friendly message for a double-click st
     raise SystemExit(1)
 
 from . import __version__
-from .core import (FONTS, FROM_PREAMBLE, OUTDIR, PREAMBLE_FILE, Options, build, build_preamble,
-                   install_preamble, missing_tools, normalize_color, read_user_preamble, render_png,
+from .core import (FONTS, FROM_PREAMBLE, OUTDIR, PREAMBLE_FILE, Options, baseline_shift,
+                   build_preamble, build_result, install_preamble, missing_tools, normalize_color,
+                   read_user_preamble, render_preview,
                    strip_overrides, to_clipboard)
 from .shortcut import APP_ID, ICON_ICO, ICON_PNG, set_window_identity
 
@@ -42,6 +43,11 @@ KEY_FROM_LABEL = {v: k for k, v in FONT_LABELS.items()}
 PASTE_LABELS = {"object": "One object (the whole equation is a single curve)",
                 "curves": "Curves (one curve per glyph, editable)"}
 PASTE_FROM_LABEL = {v: k for k, v in PASTE_LABELS.items()}
+ANCHOR_LABELS = {"baseline": "Baseline (TeX baseline, shows the shift)",
+                 "ink": "Ink (lowest written character)",
+                 "baseline-crop": "Baseline, cropped (experimental)"}
+ANCHOR_FROM_LABEL = {v: k for k, v in ANCHOR_LABELS.items()}
+DASH, MINUS, ARROW = "\u2013", "\u2212", "\u2192"
 ZOOMS = ["100 %", "150 %", "200 %", "300 %", "400 %"]
 APPEARANCES = ["Light", "Dark", "System"]
 MONO = ("Consolas", 14) if sys.platform == "win32" else ("Menlo", 13)
@@ -50,6 +56,7 @@ PREAMBLE_STUB = ("% TeXclip personal preamble - inserted after the base packages
                  "% next to them; then the settings made here are used.\n"
                  "% Example:\n% \\newcommand{\\Hamil}{\\hat{H}}\n")
 DEFAULTS = dict(size="10", color="000000", font="cm", size_pre=False, color_pre=False, font_pre=False,
+                anchor="baseline",
                 bold=False, inline=False, border="0.5", paste="object", zoom="200 %", topmost=False,
                 appearance="System", history=[], last_dir="",
                 eq=r"i\hbar\,\partial_t\ket{\psi}=\hat H\ket{\psi}", geometry="1180x760")
@@ -280,7 +287,12 @@ class App(ctk.CTk, _DnD):
         row_label(5, "Paste as")
         ctk.CTkOptionMenu(sf, variable=self.v_paste, values=list(PASTE_LABELS.values()),
                           dynamic_resizing=False).grid(row=5, column=1, columnspan=2, sticky="ew",
-                                                       padx=(0, 12), pady=(4, 12))
+                                                       padx=(0, 12), pady=4)
+        row_label(6, "Anchor")
+        self.v_anchor = tk.StringVar()
+        ctk.CTkOptionMenu(sf, variable=self.v_anchor, values=list(ANCHOR_LABELS.values()),
+                          dynamic_resizing=False, command=lambda _: self._on_style()).grid(
+            row=6, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=(4, 12))
         for v in (self.v_size, self.v_color, self.v_border):
             v.trace_add("write", lambda *_: self._on_style())
 
@@ -320,6 +332,20 @@ class App(ctk.CTk, _DnD):
         ys.grid(row=0, column=1, sticky="ns")
         xs.grid(row=1, column=0, sticky="ew")
         self.canvas.bind("<Configure>", lambda e: self._draw())
+
+        sh = ctk.CTkFrame(pv, fg_color="transparent")
+        sh.pack(fill="x", pady=(8, 0))
+        self.shift_label = ctk.CTkLabel(sh, text=f"Baseline shift: {DASH}",
+                                        font=ctk.CTkFont(size=14, weight="bold"))
+        self.shift_label.pack(side="left")
+        self.b_shift = ctk.CTkButton(sh, text="Copy value", width=110, command=self.copy_shift)
+        self.b_shift.pack(side="left", padx=12)
+        self.shift_hint = ctk.CTkLabel(
+            pv, text=f"Paste the equation first, then copy this value into Character panel {ARROW} "
+                     "Baseline shift. Valid when the equation is pasted at 100 %.",
+            text_color=MUTED, font=ctk.CTkFont(size=11), anchor="w", justify="left")
+        self.shift_hint.pack(fill="x")
+        self.shift = None
 
         pb = ctk.CTkFrame(pt, fg_color="transparent")
         pb.pack(fill="x", pady=(0, 6))
@@ -397,6 +423,9 @@ class App(ctk.CTk, _DnD):
         self.v_inline.set(bool(c["inline"]))
         self.v_border.set(str(c["border"]))
         self.v_paste.set(PASTE_LABELS.get(c["paste"], PASTE_LABELS["object"]))
+        self.v_anchor.set(ANCHOR_LABELS.get(c["anchor"], ANCHOR_LABELS["baseline"]))
+        # history entries are {"eq", "shift"}; older versions stored plain strings
+        c["history"] = [h if isinstance(h, dict) else {"eq": h, "shift": None} for h in c["history"]]
         self.v_zoom.set(c["zoom"] if c["zoom"] in ZOOMS else "200 %")
         self.v_top.set(bool(c["topmost"]))
         self.v_app.set(c["appearance"] if c["appearance"] in APPEARANCES else "System")
@@ -413,6 +442,7 @@ class App(ctk.CTk, _DnD):
                         color_pre=self.v_color_pre.get(), font_pre=self.v_font_pre.get(),
                         bold=self.v_bold.get(), inline=self.v_inline.get(), border=self.v_border.get(),
                         paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"), zoom=self.v_zoom.get(),
+                        anchor=ANCHOR_FROM_LABEL.get(self.v_anchor.get(), "baseline"),
                         topmost=self.v_top.get(), appearance=self.v_app.get(), eq=self.equation(),
                         geometry=self.geometry())
         try:
@@ -461,7 +491,8 @@ class App(ctk.CTk, _DnD):
         self.swatch.configure(fg_color=("#" + color) if color != FROM_PREAMBLE else ("gray75", "gray30"))
         font = FROM_PREAMBLE if self.v_font_pre.get() else KEY_FROM_LABEL.get(self.v_font.get(), "cm")
         return Options(size=size, color=color, font=font, bold=self.v_bold.get(), inline=self.v_inline.get(),
-                       border=border, paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"))
+                       border=border, paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"),
+                       anchor=ANCHOR_FROM_LABEL.get(self.v_anchor.get(), "baseline"))
 
     # ------------------------------------------------------------------ events
     def _on_modified(self, _e=None) -> None:
@@ -521,10 +552,11 @@ class App(ctk.CTk, _DnD):
         if choice in labels:
             i = labels.index(choice)
             self.eq.delete("1.0", "end")
-            self.eq.insert("1.0", self.cfg["history"][i])
+            self.eq.insert("1.0", self.cfg["history"][i]["eq"])
+            self.show_shift(self.cfg["history"][i].get("shift"))
 
     def _history_labels(self) -> list[str]:
-        return [f"{i + 1:>2}  " + h.replace("\n", " ")[:60] for i, h in enumerate(self.cfg["history"])]
+        return [f"{i + 1:>2}  " + h["eq"].replace("\n", " ")[:60] for i, h in enumerate(self.cfg["history"])]
 
     def _refresh_history(self) -> None:
         self.hist.configure(values=self._history_labels() or ["(empty)"])
@@ -621,7 +653,8 @@ class App(ctk.CTk, _DnD):
 
         def work() -> None:
             try:
-                self.q.put(("preview", gen, render_png(eq, opts, dpi=dpi)))
+                png, dims = render_preview(eq, opts, dpi=dpi)
+                self.q.put(("preview", gen, (png, baseline_shift(dims, opts))))
             except Exception as e:  # noqa: BLE001 - show anything LaTeX/IO throws
                 self.q.put(("error", gen, str(e)))
 
@@ -640,9 +673,9 @@ class App(ctk.CTk, _DnD):
 
         def work() -> None:
             try:
-                path = build(eq, opts)
-                copied = to_clipboard(path, opts.paste)
-                self.q.put(("copied", eq, (path, opts.paste, copied)))
+                res = build_result(eq, opts)
+                copied = to_clipboard(res.path, opts.paste)
+                self.q.put(("copied", eq, (res.path, opts.paste, copied, res.shift)))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("copy_error", 0, str(e)))
 
@@ -659,8 +692,10 @@ class App(ctk.CTk, _DnD):
                     self._busy = max(0, self._busy - 1)
                     if key == self.gen:           # results of outdated requests are dropped
                         if kind == "preview":
-                            self._img = tk.PhotoImage(data=base64.b64encode(payload))
+                            png, shift = payload
+                            self._img = tk.PhotoImage(data=base64.b64encode(png))
                             self._error = ""
+                            self.show_shift(shift)
                         else:
                             self._error = payload
                         self._log(("OK" if kind == "preview" else payload))
@@ -672,9 +707,10 @@ class App(ctk.CTk, _DnD):
                     else:
                         self.set_status("Preview up to date.")
                 elif kind == "copied":
-                    path, mode, copied = payload
+                    path, mode, copied, shift = payload
                     self.btn_copy.configure(state="normal")
-                    self._add_history(key)
+                    self._add_history(key, shift)
+                    self.show_shift(shift)
                     self.set_status(f"Copied as {mode} - press Ctrl+V in Affinity." if copied
                                     else f"Saved {path} (no clipboard support here).")
                     self._log(f"wrote {path}")
@@ -710,10 +746,29 @@ class App(ctk.CTk, _DnD):
         else:
             c.create_text(w // 2, h // 2, text="Preview appears here", fill="#999", font=("Segoe UI", 12))
 
-    def _add_history(self, eq: str) -> None:
-        h = [x for x in self.cfg["history"] if x != eq]
-        self.cfg["history"] = ([eq] + h)[:30]
+    def _add_history(self, eq: str, shift) -> None:
+        h = [x for x in self.cfg["history"] if x["eq"] != eq]
+        self.cfg["history"] = ([{"eq": eq, "shift": shift}] + h)[:30]
         self._refresh_history()
+
+    def show_shift(self, shift) -> None:
+        """Baseline shift line under the preview (a dash for anchor "ink" or when unknown)."""
+        self.shift = shift
+        if shift is None:
+            self.shift_label.configure(text=f"Baseline shift: {DASH}")
+            self.b_shift.configure(state="disabled")
+        else:
+            self.shift_label.configure(text=f"Baseline shift: {shift:.2f} pt".replace("-", MINUS))
+            self.b_shift.configure(state="normal")
+
+    def copy_shift(self) -> None:
+        """Only the number with an ASCII minus, for Affinity's Baseline shift field."""
+        if self.shift is None:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(f"{self.shift:.2f}")
+        self.update()
+        self.set_status(f"Copied {self.shift:.2f} - paste it into Character panel {ARROW} Baseline shift.")
 
     @staticmethod
     def _set_text(widget, text: str) -> None:
