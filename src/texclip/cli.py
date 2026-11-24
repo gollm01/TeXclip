@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .core import (ANCHORS, FONTS, FROM_PREAMBLE, PASTE_MODES, Options, build_result, from_preamble,
+from .core import (ALIGNMENTS, ANCHORS, FONTS, FROM_PREAMBLE, PASTE_MODES, Options, build_result, from_preamble,
                    missing_tools, normalize_color, to_clipboard)
 
 
@@ -21,6 +21,8 @@ def handle(eq: str, a: Options, name: str | None = None) -> bool:
     print(f"{out}" + (f"   [copied as {a.paste} -> Ctrl+V in Affinity]" if clip else ""))
     if res.shift is not None:
         print(f"baseline shift: {res.shift:.2f} pt")
+    if res.overflow is not None:
+        print(f"warning: the text is {res.overflow:.1f} pt taller than the frame", file=sys.stderr)
     return True
 
 
@@ -45,6 +47,17 @@ def main(argv: list[str] | None = None) -> None:
                    help="box bottom: baseline = TeX box, prints the baseline shift for Affinity "
                         "(default); ink = lowest ink; baseline-crop = box ends at the baseline (experimental)")
     p.add_argument("--no-clip", action="store_true", help="only write the file")
+    t = p.add_argument_group("text block (--text): a whole paragraph set by LaTeX in a frame")
+    t.add_argument("--text", action="store_true",
+                   help="the input is LaTeX text with $...$ math (blank line = new paragraph)")
+    t.add_argument("--width", default="80mm", help="frame width, e.g. 80mm, 300pt (default 80mm)")
+    t.add_argument("--height", default="", help="frame height (default: as tall as the text)")
+    t.add_argument("--align", default="justify-left", choices=ALIGNMENTS,
+                   help="paragraph alignment as in Affinity (default justify-left)")
+    t.add_argument("--leading", type=float, default=1.2, help="line spacing x font size (default 1.2)")
+    t.add_argument("--parskip", type=float, default=0.0, help="space between paragraphs in pt")
+    t.add_argument("--indent", type=float, default=0.0, help="first-line indent in pt")
+    t.add_argument("--no-hyphenate", action="store_true", help="switch hyphenation off")
     p.add_argument("--fonts", action="store_true", help="list font styles and exit")
     p.add_argument("--shortcut", action="store_true", help="create a desktop shortcut with the TeXclip icon and exit")
     p.add_argument("--version", action="version", version=f"texclip {__version__}")
@@ -68,7 +81,9 @@ def main(argv: list[str] | None = None) -> None:
         p.error(str(e))
     a = Options(size=size, color=color, font=args.font, bold=args.bold, inline=args.inline,
                 border=args.border, paste=args.paste, format=args.format, no_clip=args.no_clip,
-                anchor=args.anchor)
+                anchor=args.anchor, mode="text" if args.text else "math", width=args.width,
+                height=args.height, align=args.align, leading=args.leading, parskip=args.parskip,
+                indent=args.indent, hyphenate=not args.no_hyphenate)
 
     if miss := missing_tools(("latex", "dvisvgm") if a.format == "svg" else ("pdflatex",)):
         sys.exit(f"missing on PATH: {', '.join(miss)} - install a TeX distribution (MiKTeX / TeX Live)")

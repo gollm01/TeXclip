@@ -25,9 +25,9 @@ except ImportError:  # pragma: no cover - friendly message for a double-click st
     raise SystemExit(1)
 
 from . import __version__
-from .core import (FONTS, FROM_PREAMBLE, OUTDIR, PREAMBLE_FILE, Options, baseline_shift,
+from .core import (ALIGNMENTS, FONTS, FROM_PREAMBLE, OUTDIR, PREAMBLE_FILE, Options, baseline_shift,
                    build_preamble, build_result, install_preamble, missing_tools, normalize_color,
-                   read_user_preamble, render_preview,
+                   read_user_preamble, render_preview, tex_dim, text_overflow,
                    strip_overrides, to_clipboard)
 from .shortcut import APP_ID, ICON_ICO, ICON_PNG, set_window_identity
 
@@ -47,6 +47,10 @@ ANCHOR_LABELS = {"baseline": "Baseline (TeX baseline, shows the shift)",
                  "ink": "Ink (lowest written character)",
                  "baseline-crop": "Baseline, cropped (experimental)"}
 ANCHOR_FROM_LABEL = {v: k for k, v in ANCHOR_LABELS.items()}
+ALIGN_LABELS = {k: v[0] for k, v in ALIGNMENTS.items()}
+ALIGN_FROM_LABEL = {v: k for k, v in ALIGN_LABELS.items()}
+MODES = {"math": "Equation", "text": "Text block"}
+UNITS = ["mm", "pt", "cm", "in"]
 DASH, MINUS, ARROW = "\u2013", "\u2212", "\u2192"
 ZOOMS = ["100 %", "150 %", "200 %", "300 %", "400 %"]
 APPEARANCES = ["Light", "Dark", "System"]
@@ -56,7 +60,8 @@ PREAMBLE_STUB = ("% TeXclip personal preamble - inserted after the base packages
                  "% next to them; then the settings made here are used.\n"
                  "% Example:\n% \\newcommand{\\Hamil}{\\hat{H}}\n")
 DEFAULTS = dict(size="10", color="000000", font="cm", size_pre=False, color_pre=False, font_pre=False,
-                anchor="baseline",
+                anchor="baseline", mode="math", text="", tb_width="80", tb_height="", tb_unit="mm",
+                align="justify-left", leading="1.2", parskip="0", indent="0", hyphenate=True,
                 bold=False, inline=False, border="0.5", paste="object", zoom="200 %", topmost=False,
                 appearance="System", history=[], last_dir="",
                 eq=r"i\hbar\,\partial_t\ket{\psi}=\hat H\ket{\psi}", geometry="1180x760")
@@ -219,9 +224,12 @@ class App(ctk.CTk, _DnD):
         ef.grid(row=0, column=0, sticky="nsew")
         ef.grid_columnconfigure(0, weight=1)
         ef.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(ef, text="Equation", font=bold).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 0))
-        ctk.CTkLabel(ef, text="math mode, no $...$   ·   Ctrl+Enter copies", text_color=MUTED).grid(
-            row=0, column=0, sticky="e", padx=12, pady=(8, 0))
+        self.v_mode = tk.StringVar(value=MODES["math"])
+        self.mode = "math"
+        ctk.CTkSegmentedButton(ef, values=list(MODES.values()), variable=self.v_mode,
+                               command=self._on_mode).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
+        self.eq_hint = ctk.CTkLabel(ef, text="", text_color=MUTED)
+        self.eq_hint.grid(row=0, column=0, sticky="e", padx=12, pady=(8, 0))
         self.eq = ctk.CTkTextbox(ef, font=MONO, undo=True, wrap="none", border_width=1)
         self.eq.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 10))
         self.eq.bind("<<Modified>>", self._on_modified)
@@ -277,8 +285,9 @@ class App(ctk.CTk, _DnD):
         r = ctk.CTkFrame(sf, fg_color="transparent")
         r.grid(row=4, column=1, columnspan=2, sticky="w")
         ctk.CTkCheckBox(r, text="Bold", variable=self.v_bold, width=70, command=self._on_style).pack(side="left")
-        ctk.CTkCheckBox(r, text="Inline style", variable=self.v_inline, width=110,
-                        command=self._on_style).pack(side="left", padx=(8, 14))
+        self.cb_inline = ctk.CTkCheckBox(r, text="Inline style", variable=self.v_inline, width=110,
+                                         command=self._on_style)
+        self.cb_inline.pack(side="left", padx=(8, 14))
         ctk.CTkLabel(r, text="Border").pack(side="left", padx=(0, 6))
         self.e_border = ctk.CTkEntry(r, width=56, textvariable=self.v_border)
         self.e_border.pack(side="left")
@@ -290,14 +299,16 @@ class App(ctk.CTk, _DnD):
                                                        padx=(0, 12), pady=4)
         row_label(6, "Anchor")
         self.v_anchor = tk.StringVar()
-        ctk.CTkOptionMenu(sf, variable=self.v_anchor, values=list(ANCHOR_LABELS.values()),
-                          dynamic_resizing=False, command=lambda _: self._on_style()).grid(
-            row=6, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=(4, 12))
+        self.o_anchor = ctk.CTkOptionMenu(sf, variable=self.v_anchor, values=list(ANCHOR_LABELS.values()),
+                                          dynamic_resizing=False, command=lambda _: self._on_style())
+        self.o_anchor.grid(row=6, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=(4, 12))
         for v in (self.v_size, self.v_color, self.v_border):
             v.trace_add("write", lambda *_: self._on_style())
 
+        self._build_text_block(left, bold)
+
         ab = ctk.CTkFrame(left, fg_color="transparent")
-        ab.grid(row=2, column=0, sticky="ew", pady=10)
+        ab.grid(row=3, column=0, sticky="ew", pady=10)
         ab.grid_columnconfigure(0, weight=1)
         self.btn_copy = ctk.CTkButton(ab, text="Copy to clipboard", height=40, fg_color=ORANGE,
                                       hover_color=ORANGE_HOVER, text_color="#1f1300",
@@ -430,7 +441,18 @@ class App(ctk.CTk, _DnD):
         self.v_top.set(bool(c["topmost"]))
         self.v_app.set(c["appearance"] if c["appearance"] in APPEARANCES else "System")
         self.attributes("-topmost", self.v_top.get())
-        self.eq.insert("1.0", c["eq"])
+        self.v_tw.set(str(c["tb_width"]))
+        self.v_th.set(str(c["tb_height"]))
+        self.v_tunit.set(c["tb_unit"] if c["tb_unit"] in UNITS else "mm")
+        self.v_align.set(ALIGN_LABELS.get(c["align"], ALIGN_LABELS["justify-left"]))
+        self.v_leading.set(str(c["leading"]))
+        self.v_parskip.set(str(c["parskip"]))
+        self.v_indent.set(str(c["indent"]))
+        self.v_hyph.set(bool(c["hyphenate"]))
+        self.mode = c["mode"] if c["mode"] in MODES else "math"
+        self.v_mode.set(MODES[self.mode])
+        self.eq.insert("1.0", c["text"] if self.mode == "text" else c["eq"])
+        self._apply_mode()
         self.eq.edit_reset()
         self.eq.edit_modified(False)
         self._refresh_history()
@@ -443,8 +465,12 @@ class App(ctk.CTk, _DnD):
                         bold=self.v_bold.get(), inline=self.v_inline.get(), border=self.v_border.get(),
                         paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"), zoom=self.v_zoom.get(),
                         anchor=ANCHOR_FROM_LABEL.get(self.v_anchor.get(), "baseline"),
-                        topmost=self.v_top.get(), appearance=self.v_app.get(), eq=self.equation(),
-                        geometry=self.geometry())
+                        topmost=self.v_top.get(), appearance=self.v_app.get(), geometry=self.geometry(),
+                        mode=self.mode, tb_width=self.v_tw.get(), tb_height=self.v_th.get(),
+                        tb_unit=self.v_tunit.get(), align=ALIGN_FROM_LABEL.get(self.v_align.get(), "justify-left"),
+                        leading=self.v_leading.get(), parskip=self.v_parskip.get(), indent=self.v_indent.get(),
+                        hyphenate=self.v_hyph.get())
+        self.cfg["text" if self.mode == "text" else "eq"] = self.equation()
         try:
             with open(CFG_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.cfg, f, indent=1, ensure_ascii=False)
@@ -483,16 +509,19 @@ class App(ctk.CTk, _DnD):
                 raise ValueError
         except ValueError:
             ok["border"] = False
+        tb = self._text_block_fields(ok)
         normal = ctk.ThemeManager.theme["CTkEntry"]["text_color"]
-        for w, k in ((self.e_size, "size"), (self.e_color, "color"), (self.e_border, "border")):
-            w.configure(text_color=normal if ok[k] else RED)
+        for w, k in ((self.e_size, "size"), (self.e_color, "color"), (self.e_border, "border"),
+                     (self.e_tw, "width"), (self.e_th, "height"), (self.e_lead, "line spacing"),
+                     (self.e_parskip, "paragraph space"), (self.e_indent, "indent")):
+            w.configure(text_color=normal if ok.get(k, True) else RED)
         if not all(ok.values()):
             raise ValueError("invalid " + ", ".join(k for k, v in ok.items() if not v))
         self.swatch.configure(fg_color=("#" + color) if color != FROM_PREAMBLE else ("gray75", "gray30"))
         font = FROM_PREAMBLE if self.v_font_pre.get() else KEY_FROM_LABEL.get(self.v_font.get(), "cm")
         return Options(size=size, color=color, font=font, bold=self.v_bold.get(), inline=self.v_inline.get(),
                        border=border, paste=PASTE_FROM_LABEL.get(self.v_paste.get(), "object"),
-                       anchor=ANCHOR_FROM_LABEL.get(self.v_anchor.get(), "baseline"))
+                       anchor=ANCHOR_FROM_LABEL.get(self.v_anchor.get(), "baseline"), mode=self.mode, **tb)
 
     # ------------------------------------------------------------------ events
     def _on_modified(self, _e=None) -> None:
@@ -551,12 +580,19 @@ class App(ctk.CTk, _DnD):
         self.v_hist.set("History")
         if choice in labels:
             i = labels.index(choice)
+            entry = self.cfg["history"][i]
+            mode = entry.get("mode", "math")
+            if mode != self.mode:
+                self.v_mode.set(MODES[mode])
+                self._on_mode(MODES[mode])
             self.eq.delete("1.0", "end")
-            self.eq.insert("1.0", self.cfg["history"][i]["eq"])
-            self.show_shift(self.cfg["history"][i].get("shift"))
+            self.eq.insert("1.0", entry["eq"])
+            if mode == "math":
+                self.show_shift(entry.get("shift"))
 
     def _history_labels(self) -> list[str]:
-        return [f"{i + 1:>2}  " + h["eq"].replace("\n", " ")[:60] for i, h in enumerate(self.cfg["history"])]
+        return [f"{i + 1:>2}  " + ("[text] " if h.get("mode") == "text" else "") + h["eq"].replace("\n", " ")[:60]
+                for i, h in enumerate(self.cfg["history"])]
 
     def _refresh_history(self) -> None:
         self.hist.configure(values=self._history_labels() or ["(empty)"])
@@ -654,7 +690,7 @@ class App(ctk.CTk, _DnD):
         def work() -> None:
             try:
                 png, dims = render_preview(eq, opts, dpi=dpi)
-                self.q.put(("preview", gen, (png, baseline_shift(dims, opts))))
+                self.q.put(("preview", gen, (png, baseline_shift(dims, opts), text_overflow(dims, opts))))
             except Exception as e:  # noqa: BLE001 - show anything LaTeX/IO throws
                 self.q.put(("error", gen, str(e)))
 
@@ -675,7 +711,7 @@ class App(ctk.CTk, _DnD):
             try:
                 res = build_result(eq, opts)
                 copied = to_clipboard(res.path, opts.paste)
-                self.q.put(("copied", eq, (res.path, opts.paste, copied, res.shift)))
+                self.q.put(("copied", eq, (res.path, opts.paste, copied, res.shift, opts.mode, res.overflow)))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("copy_error", 0, str(e)))
 
@@ -692,10 +728,13 @@ class App(ctk.CTk, _DnD):
                     self._busy = max(0, self._busy - 1)
                     if key == self.gen:           # results of outdated requests are dropped
                         if kind == "preview":
-                            png, shift = payload
+                            png, shift, overflow = payload
                             self._img = tk.PhotoImage(data=base64.b64encode(png))
                             self._error = ""
-                            self.show_shift(shift)
+                            if self.mode == "text":
+                                self.show_frame(overflow)
+                            else:
+                                self.show_shift(shift)
                         else:
                             self._error = payload
                         self._log(("OK" if kind == "preview" else payload))
@@ -707,10 +746,13 @@ class App(ctk.CTk, _DnD):
                     else:
                         self.set_status("Preview up to date.")
                 elif kind == "copied":
-                    path, mode, copied, shift = payload
+                    path, mode, copied, shift, kind_, overflow = payload
                     self.btn_copy.configure(state="normal")
-                    self._add_history(key, shift)
-                    self.show_shift(shift)
+                    self._add_history(key, shift, kind_)
+                    if kind_ == "text":
+                        self.show_frame(overflow)
+                    else:
+                        self.show_shift(shift)
                     self.set_status(f"Copied as {mode} - press Ctrl+V in Affinity." if copied
                                     else f"Saved {path} (no clipboard support here).")
                     self._log(f"wrote {path}")
@@ -746,14 +788,139 @@ class App(ctk.CTk, _DnD):
         else:
             c.create_text(w // 2, h // 2, text="Preview appears here", fill="#999", font=("Segoe UI", 12))
 
-    def _add_history(self, eq: str, shift) -> None:
+    def _add_history(self, eq: str, shift, mode: str = "math") -> None:
         h = [x for x in self.cfg["history"] if x["eq"] != eq]
-        self.cfg["history"] = ([{"eq": eq, "shift": shift}] + h)[:30]
+        self.cfg["history"] = ([{"eq": eq, "shift": shift, "mode": mode}] + h)[:30]
         self._refresh_history()
+
+    # ------------------------------------------------------------------ text blocks
+    def _build_text_block(self, left, bold) -> None:
+        """Frame size, alignment and spacing of a text block (shown in "Text block" mode)."""
+        tf = self.tf = ctk.CTkFrame(left)
+        tf.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        tf.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(tf, text="Text block", font=bold).grid(row=0, column=0, sticky="w", padx=12, pady=(8, 2))
+        ctk.CTkLabel(tf, text="pasted at exactly this size",
+                     text_color=MUTED).grid(row=0, column=1, sticky="e", padx=12, pady=(8, 2))
+        self.v_tw, self.v_th, self.v_tunit = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.v_align, self.v_leading = tk.StringVar(), tk.StringVar()
+        self.v_parskip, self.v_indent, self.v_hyph = tk.StringVar(), tk.StringVar(), tk.BooleanVar()
+
+        def label(r, text):
+            ctk.CTkLabel(tf, text=text).grid(row=r, column=0, sticky="w", padx=12, pady=4)
+
+        label(1, "Frame")
+        r = ctk.CTkFrame(tf, fg_color="transparent")
+        r.grid(row=1, column=1, sticky="w")
+        self.e_tw = ctk.CTkEntry(r, width=64, textvariable=self.v_tw)
+        self.e_tw.pack(side="left")
+        ctk.CTkLabel(r, text="\u00d7").pack(side="left", padx=6)
+        self.e_th = ctk.CTkEntry(r, width=64, textvariable=self.v_th)
+        self.e_th.pack(side="left")
+        ctk.CTkOptionMenu(r, variable=self.v_tunit, values=UNITS, width=70,
+                          command=lambda _: self._on_style()).pack(side="left", padx=8)
+        ctk.CTkLabel(r, text="height empty = auto", text_color=MUTED).pack(side="left")
+        label(2, "Alignment")
+        ctk.CTkOptionMenu(tf, variable=self.v_align, values=list(ALIGN_LABELS.values()), dynamic_resizing=False,
+                          command=lambda _: self._on_style()).grid(row=2, column=1, sticky="ew", padx=(0, 12))
+        label(3, "Spacing")
+        r = ctk.CTkFrame(tf, fg_color="transparent")
+        r.grid(row=3, column=1, sticky="w")
+        ctk.CTkLabel(r, text="line").pack(side="left", padx=(0, 6))
+        self.e_lead = ctk.CTkEntry(r, width=50, textvariable=self.v_leading)
+        self.e_lead.pack(side="left")
+        ctk.CTkLabel(r, text="\u00d7 size").pack(side="left", padx=(6, 16))
+        ctk.CTkLabel(r, text="paragraph gap").pack(side="left", padx=(0, 6))
+        self.e_parskip = ctk.CTkEntry(r, width=50, textvariable=self.v_parskip)
+        self.e_parskip.pack(side="left")
+        ctk.CTkLabel(r, text="pt").pack(side="left", padx=(6, 0))
+        label(4, "Options")
+        r = ctk.CTkFrame(tf, fg_color="transparent")
+        r.grid(row=4, column=1, sticky="w", pady=(0, 10))
+        ctk.CTkCheckBox(r, text="Hyphenation", variable=self.v_hyph, width=120,
+                        command=self._on_style).pack(side="left")
+        ctk.CTkLabel(r, text="First-line indent").pack(side="left", padx=(8, 6))
+        self.e_indent = ctk.CTkEntry(r, width=50, textvariable=self.v_indent)
+        self.e_indent.pack(side="left")
+        ctk.CTkLabel(r, text="pt").pack(side="left", padx=6)
+        for v in (self.v_tw, self.v_th, self.v_leading, self.v_parskip, self.v_indent):
+            v.trace_add("write", lambda *_: self._on_style())
+
+    def _text_block_fields(self, ok: dict) -> dict:
+        """Text block settings as Options fields; marks invalid entries in `ok`."""
+        if self.mode != "text":
+            return {}
+        unit = self.v_tunit.get() or "mm"
+        out = {"align": ALIGN_FROM_LABEL.get(self.v_align.get(), "justify-left"), "hyphenate": self.v_hyph.get()}
+        for key, var, empty_ok in (("width", self.v_tw, False), ("height", self.v_th, True)):
+            v = var.get().strip().replace(",", ".")
+            if not v and empty_ok:
+                out[key] = ""
+                continue
+            try:
+                tex_dim(v + unit)
+                out[key] = v + unit
+            except ValueError:
+                ok[key] = False
+        for key, var, name, positive in (("leading", self.v_leading, "line spacing", True),
+                                         ("parskip", self.v_parskip, "paragraph space", False),
+                                         ("indent", self.v_indent, "indent", False)):
+            try:
+                v = float(var.get().replace(",", ".") or 0)
+                if v < 0 or (positive and v == 0):
+                    raise ValueError
+                out[key] = v
+            except ValueError:
+                ok[name] = False
+        return out
+
+    def _on_mode(self, label: str) -> None:
+        mode = "text" if label == MODES["text"] else "math"
+        if mode == self.mode:
+            return
+        self.cfg["text" if self.mode == "text" else "eq"] = self.equation()   # keep both texts
+        self.mode = mode
+        self.eq.delete("1.0", "end")
+        self.eq.insert("1.0", self.cfg["text"] if mode == "text" else self.cfg["eq"])
+        self._apply_mode()
+        self._on_style()
+
+    def _apply_mode(self) -> None:
+        text = self.mode == "text"
+        if text:
+            self.tf.grid()
+        else:
+            self.tf.grid_remove()
+        self.eq_hint.configure(text="math in $...$, empty line = paragraph" if text
+                               else "math mode, no $...$   \u00b7   Ctrl+Enter copies")
+        try:
+            self.eq.configure(wrap="word" if text else "none")
+        except (ValueError, tk.TclError):
+            pass
+        for w in (self.cb_inline, self.o_anchor):
+            w.configure(state="disabled" if text else "normal")
+        self.b_shift.configure(state="disabled")
+        if text:
+            self.b_shift.pack_forget()
+        else:
+            self.b_shift.pack(side="left", padx=12)
+        self.shift_hint.configure(
+            text="The pasted object has exactly the frame size (at 100 %). Text is curves, edit it here."
+            if text else f"Paste the equation first, then copy this value into Character panel {ARROW} "
+                         "Baseline shift. Valid when the equation is pasted at 100 %.")
+
+    def show_frame(self, overflow) -> None:
+        """Text block info under the preview: does the text fit the fixed frame height?"""
+        normal = ctk.ThemeManager.theme["CTkLabel"]["text_color"]
+        if overflow is None:
+            self.shift_label.configure(text="Text block: fits the frame", text_color=normal)
+        else:
+            self.shift_label.configure(text=f"Text is {overflow:.1f} pt taller than the frame", text_color=RED)
 
     def show_shift(self, shift) -> None:
         """Baseline shift line under the preview (a dash for anchor "ink" or when unknown)."""
         self.shift = shift
+        self.shift_label.configure(text_color=ctk.ThemeManager.theme["CTkLabel"]["text_color"])
         if shift is None:
             self.shift_label.configure(text=f"Baseline shift: {DASH}")
             self.b_shift.configure(state="disabled")

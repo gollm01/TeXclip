@@ -110,6 +110,15 @@ class Options:
     format: str = "svg"         # svg | pdf
     no_clip: bool = False       # only write the file
     anchor: str = "baseline"    # baseline | ink | baseline-crop  (see ANCHORS)
+    # text blocks: a whole paragraph (text with $...$ math) set by LaTeX in a frame
+    mode: str = "math"          # math | text
+    width: str = "80mm"         # frame width (mm, cm, in, pt = Affinity pt)
+    height: str = ""            # frame height; "" = as tall as the text
+    align: str = "justify-left"  # key of ALIGNMENTS
+    leading: float = 1.2        # line spacing as a multiple of the font size
+    parskip: float = 0.0        # space between paragraphs, pt
+    indent: float = 0.0         # first-line indent, pt
+    hyphenate: bool = True
 
     def copy(self, **kw) -> "Options":
         return replace(self, **kw)
@@ -128,13 +137,14 @@ class BuildResult:
     path: Path
     dims: Dims | None
     shift: float | None         # baseline shift for Affinity in pt (None for anchor "ink")
+    overflow: float | None = None   # text blocks: pt the text is taller than the fixed frame
 
 
 def baseline_shift(dims: Dims | None, a: Options) -> float | None:
     """Affinity puts the bottom of the pasted box on the text baseline; the box bottom lies
     dp + border below the math baseline, so the equation has to move down by that much
     (TeX pt -> Affinity pt = bp). None for anchor "ink" (no reference point)."""
-    if dims is None or a.anchor == "ink":
+    if dims is None or a.anchor == "ink" or a.mode == "text":
         return None
     if a.anchor == "baseline-crop":
         return 0.0
@@ -293,21 +303,94 @@ def make_body(eq: str, inline: bool = False) -> str:
     return f"${eq}$" if inline else f"$\\displaystyle {eq}$"
 
 
-def make_tex(eq: str, a: Options, user_preamble: str | None = None) -> str:
+# --------------------------------------------------------------------------- text blocks
+# Alignments as in Affinity's Paragraph panel. LaTeX breaks the whole paragraph at once
+# (Knuth-Plass), not line by line. The "Justify Centre/Right" glue is the TeXbook trick:
+# the +1fil/-1fil cancel on full lines, only the last line gets the fil from \parfillskip.
+ALIGNMENTS = {
+    "justify-left": ("Justify Left", r"\justifying"),
+    "justify-center": ("Justify Centre",
+                       r"\justifying\leftskip=0pt plus 1fil\rightskip=0pt plus -1fil\parfillskip=0pt plus 2fil"),
+    "justify-right": ("Justify Right",
+                      r"\justifying\leftskip=0pt plus 1fil\rightskip=0pt plus -1fil\parfillskip=0pt plus 1fil"),
+    "justify-all": ("Justify All", r"\justifying\parfillskip=0pt"),
+    "left": ("Align Left", r"\RaggedRight"),
+    "center": ("Align Centre", r"\Centering"),
+    "right": ("Align Right", r"\RaggedLeft"),
+}
+TEXT_PACKAGES = r"\usepackage{ragged2e}\usepackage{microtype}"
+_DIM = re.compile(r"^\s*(\d+(?:\.\d*)?|\.\d+)\s*(mm|cm|in|pt|bp)?\s*$")
+
+
+def tex_dim(value: str, default_unit: str = "pt") -> tuple[str, float]:
+    """'80mm' / '300' / '300pt' -> (LaTeX dimension, size in Affinity pt). Affinity's pt is the
+    PostScript point, i.e. TeX's bp, so 'pt' is written as bp to keep sizes identical."""
+    m = _DIM.match(str(value))
+    if not m:
+        raise ValueError(f"not a length: {value!r} (use e.g. 80mm, 300pt)")
+    num, unit = float(m.group(1)), (m.group(2) or default_unit)
+    if num <= 0:
+        raise ValueError("length must be positive")
+    unit = "bp" if unit == "pt" else unit
+    to_bp = {"bp": 1.0, "mm": 72 / 25.4, "cm": 72 / 2.54, "in": 72.0}[unit]
+    return f"{num:g}{unit}", num * to_bp
+
+
+def make_text_body(text: str, a: Options) -> str:
+    """A paragraph block (minipage of the chosen width) with the chosen alignment."""
+    width, _ = tex_dim(a.width)
+    if a.align not in ALIGNMENTS:
+        raise ValueError(f"alignment must be one of {', '.join(ALIGNMENTS)}")
+    # alignment first: ragged2e's commands reset \parindent to their own defaults
+    setup = [ALIGNMENTS[a.align][1], rf"\setlength\parindent{{{float(a.indent):g}bp}}",
+             rf"\setlength\parskip{{{float(a.parskip):g}bp}}", r"\frenchspacing"]
+    if not a.hyphenate:
+        setup.append(r"\hyphenpenalty=10000\exhyphenpenalty=10000")
+    return rf"\begin{{minipage}}[t]{{{width}}}" + "".join(setup) + "\n" + text.strip() + "\n" + r"\end{minipage}"
+
+
+def make_tex(eq: str, a: Options, user_preamble: str | None = None, preview: bool = False) -> str:
+    text = a.mode == "text"
     style = ""
     if not from_preamble(a.size):
         size = float(a.size)
         if size <= 0:
             raise ValueError("size must be positive")
-        style += f"\\fontsize{{{size:g}}}{{{round(size * 1.2, 2):g}}}\\selectfont"
+        lead = float(a.leading) if text else 1.2
+        if lead <= 0:
+            raise ValueError("line spacing must be positive")
+        style += f"\\fontsize{{{size:g}}}{{{round(size * lead, 2):g}}}\\selectfont"
     if a.bold:
         style += r"\boldmath"
     if not from_preamble(a.color):
         style += f"\n\\color[HTML]{{{normalize_color(a.color)}}}"
-    body = make_body(eq, a.inline)
-    output = _OUTPUT["ink"].format(body=body) if a.anchor == "ink" else _OUTPUT["default"]
-    return TEMPLATE.format(bp=a.border, preamble=build_preamble(a, user_preamble),
-                           style=style.strip("\n"), body=body, output=output)
+    preamble = build_preamble(a, user_preamble)
+    if text:
+        body = make_text_body(eq, a)
+        output = _OUTPUT["default"]
+        if a.height:                         # fixed frame height, text from the top
+            height, _ = tex_dim(a.height)
+            width, _ = tex_dim(a.width)
+            output = rf"\parbox[t][{height}][t]{{{width}}}{{\usebox\texclipbox}}"
+        if preview:                          # thin grey frame so the preview shows the whole box
+            output = (r"\colorlet{texclipfg}{.}{\color[HTML]{B4B4B4}\setlength\fboxsep{0pt}"
+                      r"\setlength\fboxrule{0.5bp}\fbox{\color{texclipfg}" + output + "}}")
+        preamble += "\n" + TEXT_PACKAGES
+        border = 0                           # the box is exactly the frame
+    else:
+        body = make_body(eq, a.inline)
+        output = _OUTPUT["ink"].format(body=body) if a.anchor == "ink" else _OUTPUT["default"]
+        border = a.border
+    return TEMPLATE.format(bp=border, preamble=preamble, style=style.strip("\n"), body=body, output=output)
+
+
+def text_overflow(dims: Dims | None, a: Options) -> float | None:
+    """How much taller (Affinity pt) the text is than the fixed frame height; None if it fits."""
+    if a.mode != "text" or not a.height or dims is None:
+        return None
+    _, h_bp = tex_dim(a.height)
+    over = (dims.ht + dims.dp) * TEX_PT_TO_BP - h_bp
+    return round(over, 1) if over > 0.05 else None
 
 
 # --------------------------------------------------------------------------- building
@@ -362,6 +445,8 @@ def build_result(eq: str, a: Options, name: str | None = None) -> BuildResult:
     """Like build(), plus the TeX dimensions and the baseline shift for Affinity."""
     if a.anchor not in ANCHORS:
         raise ValueError(f"anchor must be one of {', '.join(ANCHORS)}")
+    if a.mode not in ("math", "text"):
+        raise ValueError("mode must be math or text")
     tex = make_tex(eq, a)
     OUTDIR.mkdir(parents=True, exist_ok=True)
     name = name or "eq_" + hashlib.sha1(tex.encode()).hexdigest()[:8]
@@ -373,7 +458,7 @@ def build_result(eq: str, a: Options, name: str | None = None) -> BuildResult:
                 raise RuntimeError("dvisvgm not found (install it via the MiKTeX Console)")
             out = OUTDIR / f"{name}.svg"
             # ink: box = lowest/highest ink; baseline: box = TeX box + border (standalone's papersize)
-            bbox = "--exact-bbox" if a.anchor == "ink" else "--bbox=papersize"
+            bbox = "--exact-bbox" if a.anchor == "ink" and a.mode != "text" else "--bbox=papersize"
             cmd = ["dvisvgm", "--no-fonts", bbox, "-o", str(out), "eq.dvi"]
             if a.font in EXTRA_FONTMAPS:
                 cmd.insert(1, f"--fontmap=+{EXTRA_FONTMAPS[a.font]}")
@@ -384,10 +469,10 @@ def build_result(eq: str, a: Options, name: str | None = None) -> BuildResult:
             if bad:
                 out.unlink(missing_ok=True)
                 raise RuntimeError("dvisvgm could not find glyph outlines for this font:\n" + "\n".join(bad))
-            if a.anchor == "baseline-crop" and dims:
+            if a.anchor == "baseline-crop" and dims and a.mode != "text":
                 out.write_text(crop_at_baseline(out.read_text(encoding="utf-8"), dims, float(a.border)),
                                encoding="utf-8")
-            return BuildResult(out, dims, baseline_shift(dims, a))
+            return BuildResult(out, dims, baseline_shift(dims, a), text_overflow(dims, a))
         (Path(tmp) / "eq.tex").write_text(tex, encoding="utf-8")
         try:
             run(["pdflatex", "-interaction=nonstopmode", "-halt-on-error", "eq.tex"], tmp)
@@ -407,7 +492,7 @@ def build_result(eq: str, a: Options, name: str | None = None) -> BuildResult:
         shutil.copy(pdf, out)
         # a PDF page is always the TeX box + border, so the shift is the same as for "baseline"
         return BuildResult(out, dims, baseline_shift(dims, a.copy(anchor="baseline")
-                                                     if a.anchor != "ink" else a))
+                                                     if a.anchor != "ink" else a), text_overflow(dims, a))
 
 
 def render_preview(eq: str, a: Options, dpi: int = 200,
@@ -415,7 +500,7 @@ def render_preview(eq: str, a: Options, dpi: int = 200,
     """Fast raster preview (latex -> dvipng, transparent background) plus the TeX dimensions."""
     if not shutil.which("dvipng"):
         raise RuntimeError("dvipng not found (install it via the MiKTeX Console); preview disabled")
-    tex = make_tex(eq, a, user_preamble)
+    tex = make_tex(eq, a, user_preamble, preview=True)
     with _tmpdir() as tmp:
         dims = _compile_dvi(tex, tmp)
         run(["dvipng", "-T", "tight", "-D", str(dpi), "-bg", "Transparent", "-q*",

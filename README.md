@@ -27,6 +27,8 @@ a crisp, infinitely scalable equation. The SVG also works in Inkscape, Illustrat
   equations you paste.
 - **Modern interface** (customtkinter) with a **light, dark or system** theme.
 - **Two paste modes:** one scalable object, or curves with every glyph individually editable.
+- **Text blocks:** whole paragraphs with math, justified by LaTeX (not line by line), in a frame of
+  exactly the size you set, with Affinity's alignment options.
 - **Baseline anchor for equations inside text:** TeXclip measures the TeX depth and shows the
   baseline shift to enter in Affinity's Character panel (see *Anchor* below).
 - Equation history, remembers your settings, "always on top" so it can float next to Affinity.
@@ -140,6 +142,27 @@ The value is only correct if the equation is pasted at **100 %**. Scaling the pa
 scales the needed shift too. The shift is stored in the history, so re-copying an old equation
 shows its value again. The CLI prints it as `baseline shift: -3.47 pt` after the output path.
 
+### Text blocks: whole paragraphs set by LaTeX
+
+Affinity justifies text **line by line**. LaTeX breaks a **whole paragraph at once**
+(Knuth–Plass), with hyphenation and microtype, so word spacing stays even. Switch the editor to
+**Text block**, write normal LaTeX text with `$...$` math (an empty line starts a new
+paragraph), and set:
+
+| Setting | Meaning |
+|---|---|
+| **Frame** | width × height in mm, pt, cm or in. Leave the height empty and the block is as tall as the text. With a fixed height, TeXclip warns when the text does not fit. |
+| **Alignment** | as in Affinity: Justify Left / Centre / Right / All, Align Left / Centre / Right |
+| **Spacing** | line spacing (× font size), gap between paragraphs, first-line indent |
+| **Hyphenation** | on or off |
+
+Font, size, colour and bold come from the *Style* fields, or from your preamble. The pasted
+object is exactly the frame size when pasted at 100 %. Here *pt* means Affinity's point (TeX's
+`bp`), so 300 pt in TeXclip is 300 pt in Affinity. The text arrives as curves: edit it in
+TeXclip, not in Affinity. The editor keeps your equation and your text block separately, and the
+history marks text blocks with `[text]`. The preview draws a thin grey frame around the box,
+which the exported SVG does not contain.
+
 ## Command line
 
 ```powershell
@@ -152,6 +175,7 @@ texclip --fonts                   # list the font styles
 texclip -s preamble --font preamble 'x^2'   # size and font from the preamble file
 texclip -s 30 't_g'                         # prints: baseline shift: -9.05 pt
 texclip --anchor ink 't_g'                  # old behaviour: box ends at the lowest ink
+texclip --text --width 90mm --align justify-left -s 12 'A paragraph with $x^2$ ...'
 ```
 
 In PowerShell use single quotes (`cmd.exe` treats `^` as an escape character).

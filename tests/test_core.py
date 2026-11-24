@@ -271,6 +271,51 @@ def test_latex_error_writes_no_svg(tmp_path, monkeypatch):           # spec test
     assert not list(tmp_path.glob("*.svg"))
 
 
+# ---- text blocks --------------------------------------------------------------------------
+def test_tex_dim_uses_affinity_points():
+    assert core.tex_dim("80mm") == ("80mm", pytest.approx(80 * 72 / 25.4))
+    assert core.tex_dim("300") == ("300bp", 300.0)          # pt = Affinity pt = TeX bp
+    assert core.tex_dim("300 pt")[0] == "300bp"
+    for bad in ("", "abc", "-5mm", "10px"):
+        with pytest.raises(ValueError):
+            core.tex_dim(bad)
+
+
+def test_text_block_tex():
+    a = Options(mode="text", width="80mm", align="center", parskip=6, hyphenate=False)
+    tex = make_tex("Some $x$ text.", a, user_preamble="")
+    assert r"\begin{minipage}[t]{80mm}" in tex and r"\Centering" in tex
+    assert r"\setlength\parskip{6bp}" in tex and r"\hyphenpenalty=10000" in tex
+    assert "ragged2e" in tex and r"\documentclass[border=0pt]{standalone}" in tex
+    assert r"\parbox" not in tex and r"\fbox" not in tex
+    fixed = make_tex("x", a.copy(height="40mm"), user_preamble="", preview=True)
+    assert r"\parbox[t][40mm][t]{80mm}" in fixed and r"\fbox" in fixed     # frame only in the preview
+    for key in core.ALIGNMENTS:
+        assert core.ALIGNMENTS[key][1] in make_tex("x", a.copy(align=key), user_preamble="")
+    with pytest.raises(ValueError):
+        make_tex("x", a.copy(align="sideways"), user_preamble="")
+
+
+@needs_tex
+@pytest.mark.tex
+def test_text_block_has_the_frame_size(tmp_path, monkeypatch):
+    import re
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    text = ("A paragraph of text with $x^2$ inline math that is long enough to be broken "
+            "into several lines by the paragraph builder.\n\nA second paragraph.")
+    viewbox = lambda r: [float(v) for v in re.search(r"viewBox='([^']+)'",
+                                                     r.path.read_text(encoding="utf-8")).group(1).split()]
+    for align in core.ALIGNMENTS:
+        r = core.build_result(text, Options(mode="text", width="60mm", align=align))
+        assert abs(viewbox(r)[2] - 60 * 72 / 25.4) < 0.01 and r.shift is None and r.overflow is None
+    fixed = core.build_result(text, Options(mode="text", width="60mm", height="50mm"))
+    assert abs(viewbox(fixed)[3] - 50 * 72 / 25.4) < 0.01 and fixed.overflow is None
+    tight = core.build_result(text, Options(mode="text", width="60mm", height="5mm"))
+    assert tight.overflow and tight.overflow > 10                  # reported, box keeps 5 mm
+    assert abs(viewbox(tight)[3] - 5 * 72 / 25.4) < 0.01
+
+
 @needs_tex
 @pytest.mark.tex
 def test_size_from_preamble_takes_effect(monkeypatch, tmp_path):
