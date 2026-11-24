@@ -9,9 +9,7 @@ your own TeX installation, converts every glyph to a path (so no Computer Modern
 on the other side), and puts the result on the clipboard. Press `Ctrl+V` in Affinity and you have
 a crisp, infinitely scalable equation. The SVG also works in Inkscape, Illustrator, Figma, etc.
 
-| Light | Dark |
-|---|---|
-| ![TeXclip window, light theme](docs/screenshot.png) | ![TeXclip window, dark theme](docs/screenshot_dark.png) |
+![TeXclip window](docs/screenshot.png)
 
 ## Features
 
