@@ -6,3 +6,8 @@ dist/
 .venv/
 .pytest_cache/
 .texclip_gui.json
+
+# LaTeX leftovers
+*.log
+*.aux
+*.dvi
