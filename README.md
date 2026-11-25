@@ -103,12 +103,16 @@ need Ghostscript for `dvisvgm`; `braket` clashes with `physics`.
 | Mode | Result in Affinity |
 |---|---|
 | **object** (default) | the whole equation is one curve (one per colour), scales as a whole |
-| **curves** | one curve per glyph, each selectable and editable |
+| **curves** | one curve per glyph, grouped as `line01` > `line01_word03` > glyph. The groups appear as layers in Affinity, so a whole line or a single word can be selected (and recoloured) at once |
 
 On Windows, the SVG goes on the clipboard under the format names Affinity reads:
 `image/x-inkscape-svg` (Inkscape's) and `Scalable Vector Graphics` (Illustrator's).
 `image/svg+xml` is added for other programs. Glyph references are resolved into plain paths first.
 If pasting fails, drag the `.svg` from the output folder onto the canvas or use *File > Place*.
+Paste on the **canvas** (Move tool, no text cursor). With a text cursor active, Affinity inserts
+everything as one inline object. Affinity puts pasted curves into a group: double-click into
+the group or use the Layers panel to reach single glyphs. *Log* tab > **Save clipboard SVG…**
+writes exactly what the last copy put on the clipboard, to compare with *File > Place*.
 
 ### Equations inside text: the Anchor option
 
@@ -178,6 +182,26 @@ texclip --text --width 90mm --align justify-left -s 12 'A paragraph with $x^2$ .
 
 In PowerShell use single quotes (`cmd.exe` treats `^` as an escape character).
 Output goes to `~/texclip/` (override with the `TEXCLIP_DIR` environment variable).
+
+## Speed
+
+Every change compiles the document again. To keep that fast:
+
+- **Precompiled preamble:** everything before `egin{document}` is dumped once into a format
+  (package `mylatexformat`, built in the background) and reused while the preamble stays the
+  same. If that is not possible, TeXclip compiles normally.
+- **No second compile:** *Copy* reuses the compile of the preview when the document is the same,
+  which is always the case for equations.
+- **Instant revisits:** previews of recent states are kept in memory, so undo or switching back
+  shows them at once.
+- **No backlog:** a compile for outdated text is stopped as soon as you keep typing. Long text
+  blocks wait a little longer before recompiling, up to 1.5 s, and wide blocks get a
+  lower-resolution preview.
+- **Timeouts:** every external program has a timeout (default 90 s, `TEXCLIP_TIMEOUT`). Running
+  programs are stopped when the window closes.
+
+The cache lives in `~/.texclip_cache` (`TEXCLIP_CACHE`). `TEXCLIP_NO_FORMAT=1` switches the
+precompiled preamble off.
 
 ## How it works
 

@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -175,11 +177,51 @@ def _nowindow() -> dict:
     return {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 
 
-def run(cmd, cwd):
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", **_nowindow())
+TIMEOUT = float(os.environ.get("TEXCLIP_TIMEOUT", 90))    # s; MiKTeX may install packages on first use
+_RUNNING: dict[str, set] = {}                             # tag -> running processes (for cancel())
+_CANCELLED: set = set()
+_LOCK = threading.Lock()
+
+
+class Cancelled(RuntimeError):
+    """The job was superseded (e.g. a newer preview) and its processes were stopped."""
+
+
+def cancel(tag: str | None = None) -> None:
+    """Stop every running external process of `tag` (all tags if None)."""
+    with _LOCK:
+        for t, procs in _RUNNING.items():
+            if tag is None or t == tag:
+                for p in list(procs):
+                    _CANCELLED.add(id(p))
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+
+
+def run(cmd, cwd, tag: str = "job", timeout: float | None = None):
+    """Run an external program; raise RuntimeError on failure, Cancelled if cancel(tag) stopped it."""
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         encoding="utf-8", errors="replace", **_nowindow())
+    with _LOCK:
+        _RUNNING.setdefault(tag, set()).add(p)
+    try:
+        out, err = p.communicate(timeout=timeout or TIMEOUT)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        raise RuntimeError(f"{Path(cmd[0]).name} did not finish within {timeout or TIMEOUT:.0f} s. "
+                           "If MiKTeX is installing a package, wait a moment and try again.") from None
+    finally:
+        with _LOCK:
+            _RUNNING.get(tag, set()).discard(p)
+    if id(p) in _CANCELLED:
+        _CANCELLED.discard(id(p))
+        raise Cancelled("superseded")
+    r = subprocess.CompletedProcess(cmd, p.returncode, out, err)
     if r.returncode != 0:
-        raise RuntimeError(r.stdout[-3000:] + r.stderr[-2000:])
+        raise RuntimeError(out[-3000:] + err[-2000:])
     return r
 
 
@@ -410,12 +452,103 @@ def read_dims(tmp: str) -> Dims | None:
     return Dims(*(float(v) for v in m.groups())) if m else None
 
 
-def _compile_dvi(tex: str, tmp: str) -> Dims | None:
-    (Path(tmp) / "eq.tex").write_text(tex, encoding="utf-8")
+# --------------------------------------------------------------------------- speed
+# 1. Precompiled preamble: everything before \begin{document} is dumped once into a format
+#    (package mylatexformat) and loaded from it afterwards; key = hash of that preamble.
+# 2. Compile cache: the DVI + log of the last documents are kept, so "Copy" after a preview
+#    of the same document only runs dvisvgm.
+CACHE_DIR = Path(os.environ.get("TEXCLIP_CACHE", Path.home() / ".texclip_cache"))
+USE_FORMAT = os.environ.get("TEXCLIP_NO_FORMAT", "") == ""
+_FMT_BUILDING: set = set()
+_FMT_FAILED: set = set()
+_DVI_KEEP = 40
+_ENGINE: list = []
+
+
+def _engine_id() -> str:
+    if not _ENGINE:
+        try:
+            r = subprocess.run(["latex", "--version"], capture_output=True, text=True, **_nowindow())
+            _ENGINE.append(r.stdout.splitlines()[0] if r.stdout else "?")
+        except OSError:
+            _ENGINE.append("?")
+    return _ENGINE[0]
+
+
+def _preamble_key(tex: str) -> str:
+    head = tex.split(r"\begin{document}")[0]
+    return hashlib.sha1((head + _engine_id()).encode()).hexdigest()[:16]
+
+
+def _build_format(tex: str, key: str) -> None:
+    """Dump the preamble of `tex` into CACHE_DIR/fmt/tc_<key>.fmt (runs in a background thread)."""
     try:
-        run(["latex", "-interaction=nonstopmode", "-halt-on-error", "eq.tex"], tmp)
+        with _tmpdir() as tmp:
+            head = tex.split(r"\begin{document}")[0]
+            (Path(tmp) / "pre.tex").write_text(head + "\\begin{document}\n\\end{document}\n", encoding="utf-8")
+            run(["latex", "-ini", "-interaction=nonstopmode", f"-jobname=tc_{key}", "&latex",
+                 "mylatexformat.ltx", "pre.tex"], tmp, tag="format", timeout=180)
+            dest = CACHE_DIR / "fmt"
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(Path(tmp) / f"tc_{key}.fmt"), str(dest / f"tc_{key}.fmt"))
+    except (RuntimeError, OSError):
+        _FMT_FAILED.add(key)            # e.g. mylatexformat missing: keep compiling normally
+    finally:
+        _FMT_BUILDING.discard(key)
+
+
+def _format_for(tex: str) -> Path | None:
+    """The cached format for this preamble, or None (then one is built in the background)."""
+    if not USE_FORMAT:
+        return None
+    key = _preamble_key(tex)
+    fmt = CACHE_DIR / "fmt" / f"tc_{key}.fmt"
+    if fmt.exists():
+        return fmt
+    if key not in _FMT_FAILED and key not in _FMT_BUILDING:
+        _FMT_BUILDING.add(key)
+        threading.Thread(target=_build_format, args=(tex, key), daemon=True).start()
+    return None
+
+
+def _latex(tmp: str, tex: str, tag: str) -> None:
+    fmt = _format_for(tex)
+    if fmt is not None:
+        try:
+            shutil.copyfile(fmt, Path(tmp) / "tcfmt.fmt")
+            run(["latex", "-interaction=nonstopmode", "-halt-on-error", "&tcfmt", "eq.tex"], tmp, tag=tag)
+            return
+        except RuntimeError as e:
+            if isinstance(e, Cancelled) or "format" not in str(e).lower():
+                raise                    # a real LaTeX error (or cancelled), not a format problem
+            fmt.unlink(missing_ok=True)  # stale format (e.g. after a TeX update): rebuild later
+    run(["latex", "-interaction=nonstopmode", "-halt-on-error", "eq.tex"], tmp, tag=tag)
+
+
+def _compile_dvi(tex: str, tmp: str, tag: str = "job") -> Dims | None:
+    (Path(tmp) / "eq.tex").write_text(tex, encoding="utf-8")
+    key = hashlib.sha1(tex.encode()).hexdigest()[:20]
+    cached = CACHE_DIR / "dvi" / key
+    if (cached / "eq.dvi").exists() and (cached / "eq.log").exists():
+        for f in ("eq.dvi", "eq.log"):
+            shutil.copyfile(cached / f, Path(tmp) / f)
+        os.utime(cached)
+        return read_dims(tmp)
+    try:
+        _latex(tmp, tex, tag)
+    except Cancelled:
+        raise
     except RuntimeError as e:
         raise RuntimeError("LaTeX error:\n" + latex_error(str(e))) from None
+    try:                                # keep the result for the next step (preview -> copy)
+        cached.mkdir(parents=True, exist_ok=True)
+        for f in ("eq.dvi", "eq.log"):
+            shutil.copyfile(Path(tmp) / f, cached / f)
+        old = sorted((CACHE_DIR / "dvi").iterdir(), key=lambda p: p.stat().st_mtime)
+        for p in old[:-_DVI_KEEP]:
+            shutil.rmtree(p, ignore_errors=True)
+    except OSError:
+        pass
     return read_dims(tmp)
 
 
@@ -501,11 +634,22 @@ def render_preview(eq: str, a: Options, dpi: int = 200,
     if not shutil.which("dvipng"):
         raise RuntimeError("dvipng not found (install it via the MiKTeX Console); preview disabled")
     tex = make_tex(eq, a, user_preamble, preview=True)
+    key = (hashlib.sha1(tex.encode()).hexdigest(), int(dpi))
+    if key in _PREVIEWS:                 # undo / switching back: instant
+        _PREVIEWS.move_to_end(key)
+        return _PREVIEWS[key]
     with _tmpdir() as tmp:
-        dims = _compile_dvi(tex, tmp)
+        dims = _compile_dvi(tex, tmp, tag="preview")
         run(["dvipng", "-T", "tight", "-D", str(dpi), "-bg", "Transparent", "-q*",
-             "-o", "eq.png", "eq.dvi"], tmp)
-        return (Path(tmp) / "eq.png").read_bytes(), dims
+             "-o", "eq.png", "eq.dvi"], tmp, tag="preview")
+        result = (Path(tmp) / "eq.png").read_bytes(), dims
+    _PREVIEWS[key] = result
+    while len(_PREVIEWS) > 40:
+        _PREVIEWS.popitem(last=False)
+    return result
+
+
+_PREVIEWS: OrderedDict = OrderedDict()   # (hash of the .tex, dpi) -> (png, dims)
 
 
 def render_png(eq: str, a: Options, dpi: int = 200, user_preamble: str | None = None) -> bytes:
@@ -554,7 +698,7 @@ def _path_abs(d: str, m) -> str:
     """Rewrite path data with all coordinates transformed by m, as absolute M/L/C/Q/Z."""
     a, b, c, dd, e, f = m
     tp = lambda x, y: (a * x + c * y + e, b * x + dd * y + f)
-    fmt = lambda p: f"{p[0]:.3f} {p[1]:.3f}"
+    fmt = lambda p: f"{p[0]:.2f} {p[1]:.2f}"          # 0.01 pt is far below anything visible
     toks = re.findall(r"[A-Za-z]|" + _NUM, d)
     out, i, cmd = [], 0, ""
     cx = cy = sx = sy = 0.0
@@ -643,6 +787,48 @@ def _rect_path(x, y, w, h, m, positive: bool) -> str:
         "M{} {}L{} {}L{} {}L{} {}Z".format(*[v for p in corners[::-1] for v in p]), m)
 
 
+def _bbox(d: str):
+    v = [float(x) for x in re.findall(_NUM, d)]
+    xs, ys = v[0::2], v[1::2]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _grouped_paths(pieces) -> list[str]:
+    """"curves" mode: <g> per line > <g> per word > <path> per glyph. The ids become layer
+    names in Affinity, so lines and words can be picked (and recoloured) in the Layers panel."""
+    items = [(col, d, _bbox(d)) for col, d in pieces]
+    lines: list[dict] = []
+    # a glyph belongs to the current line if it overlaps it vertically by at least 30 % of its
+    # own height (letters, commas, descenders and sub/superscripts of one line all do; the next
+    # line starts below the previous line's descenders)
+    for it in sorted(items, key=lambda t: t[2][1]):
+        top, bottom = it[2][1], it[2][3]
+        h = max(bottom - top, 1e-6)
+        ln = lines[-1] if lines else None
+        if ln and min(ln["bottom"], bottom) - top >= 0.3 * h:
+            ln["bottom"] = max(ln["bottom"], bottom)
+            ln["items"].append(it)
+        else:
+            lines.append({"top": top, "bottom": bottom, "items": [it]})
+    out = []
+    for li, ln in enumerate(lines, 1):
+        row = sorted(ln["items"], key=lambda t: t[2][0])
+        heights = sorted(t[2][3] - t[2][1] for t in row)
+        gap = 0.3 * heights[len(heights) // 2]                 # wider than a kern, narrower than a space
+        words, right = [], None
+        for it in row:
+            if right is None or it[2][0] - right > gap:
+                words.append([])
+            words[-1].append(it)
+            right = it[2][2] if right is None else max(right, it[2][2])
+        out.append(f'<g id="line{li:02d}">')
+        for wi, word in enumerate(words, 1):
+            out.append(f'<g id="line{li:02d}_word{wi:02d}">'
+                       + "".join(f'<path d="{d}" fill="{col}"/>' for col, d, _ in word) + "</g>")
+        out.append("</g>")
+    return out
+
+
 def flatten_svg(svg_text: str, merge: bool = True) -> str:
     """Resolve the glyph references of a dvisvgm SVG into plain paths.
 
@@ -693,7 +879,7 @@ def flatten_svg(svg_text: str, merge: bool = True) -> str:
             by_color.setdefault(col, []).append(d)
         paths = [f'<path d="{" ".join(ds)}" fill="{col}"/>' for col, ds in by_color.items()]
     else:
-        paths = [f'<path d="{d}" fill="{col}"/>' for col, d in pieces]
+        paths = _grouped_paths(pieces)
     overflow = f' overflow="{root.get("overflow")}"' if root.get("overflow") else ""
     head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{root.get("width")}" '
             f'height="{root.get("height")}" viewBox="{root.get("viewBox")}"{overflow}>')
@@ -702,12 +888,26 @@ def flatten_svg(svg_text: str, merge: bool = True) -> str:
 
 def clipboard_svg(path: Path, mode: str) -> str:
     """SVG text to put on the clipboard for a paste mode (falls back to the file as is)."""
+    global LAST_CLIPBOARD_SVG
     text = path.read_text(encoding="utf-8")
     try:
-        return flatten_svg(text, merge=(mode != "curves"))
+        LAST_CLIPBOARD_SVG = flatten_svg(text, merge=(mode != "curves"))
     except (ValueError, IndexError, KeyError) as e:   # unexpected SVG structure: keep the original
         print(f"texclip: could not flatten SVG ({e}); copying it unchanged", file=sys.stderr)
-        return text
+        LAST_CLIPBOARD_SVG = text
+    return LAST_CLIPBOARD_SVG
+
+
+LAST_CLIPBOARD_SVG = ""          # exactly what went onto the clipboard last ("Save clipboard SVG...")
+
+
+def clipboard_stats(svg: str) -> str:
+    """'1443 glyphs in 26 lines' (curves) / 'one object' (merged) - for the status line."""
+    lines = len(re.findall(r'<g id="line\d+"', svg))
+    paths = svg.count("<path")
+    if lines:
+        return f"{paths} glyphs in {lines} line{'s' if lines != 1 else ''}"
+    return "one object" if paths <= 1 else f"{paths} objects (one per colour)"
 
 
 # Affinity reads SVG from the clipboard under Inkscape's and Illustrator's format names (not

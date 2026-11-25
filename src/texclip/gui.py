@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover - friendly message for a double-click st
     raise SystemExit(1)
 
 from . import __version__
+from . import core
 from .core import (ALIGNMENTS, FONTS, FROM_PREAMBLE, OUTDIR, PREAMBLE_FILE, Options, baseline_shift,
                    build_preamble, build_result, install_preamble, missing_tools, normalize_color,
                    read_user_preamble, render_preview, tex_dim, text_overflow,
@@ -370,6 +371,11 @@ class App(ctk.CTk, _DnD):
         self.pre_note = ctk.CTkLabel(pt, text="", text_color=MUTED, justify="left", anchor="w", wraplength=560)
         self.pre_note.pack(fill="x", pady=(6, 0))
 
+        lb = ctk.CTkFrame(lg, fg_color="transparent")
+        lb.pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(lb, text="Save clipboard SVG\u2026", width=170, command=self.save_clipboard_svg).pack(side="left")
+        ctk.CTkLabel(lb, text="exactly what the last copy put on the clipboard (to test with File > Place)",
+                     text_color=MUTED).pack(side="left", padx=10)
         self.log = ctk.CTkTextbox(lg, font=MONO, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
 
@@ -478,6 +484,7 @@ class App(ctk.CTk, _DnD):
             pass
 
     def _close(self) -> None:
+        core.cancel()                       # no latex/dvipng left running after the window closes
         self._save_cfg()
         for job in (self._after, self._poll_id):
             if job:
@@ -561,7 +568,10 @@ class App(ctk.CTk, _DnD):
         except OSError:
             return 0.0
 
-    def schedule(self, delay: int = 500) -> None:
+    def schedule(self, delay: int | None = None) -> None:
+        """Recompile after a pause in typing; long texts wait a little longer (max 1.5 s)."""
+        if delay is None:
+            delay = min(1500, 400 + len(self.equation()) // 10) if self.mode == "text" else 400
         if self._after:
             self.after_cancel(self._after)
         self._after = self.after(delay, self.refresh)
@@ -684,6 +694,9 @@ class App(ctk.CTk, _DnD):
         self.gen += 1
         zoom = int((self.v_zoom.get() or "200").split()[0])
         gen, dpi = self.gen, int(96 * zoom / 100)
+        if opts.mode == "text":            # a wide block would give a huge, slow image
+            dpi = max(30, min(dpi, int(2400 * 72 / tex_dim(opts.width)[1])))
+        core.cancel("preview")              # the running compile is outdated now
         self._busy += 1
         self.set_status("Compiling...")
 
@@ -691,6 +704,8 @@ class App(ctk.CTk, _DnD):
             try:
                 png, dims = render_preview(eq, opts, dpi=dpi)
                 self.q.put(("preview", gen, (png, baseline_shift(dims, opts), text_overflow(dims, opts))))
+            except core.Cancelled:
+                self.q.put(("cancelled", gen, None))
             except Exception as e:  # noqa: BLE001 - show anything LaTeX/IO throws
                 self.q.put(("error", gen, str(e)))
 
@@ -711,7 +726,8 @@ class App(ctk.CTk, _DnD):
             try:
                 res = build_result(eq, opts)
                 copied = to_clipboard(res.path, opts.paste)
-                self.q.put(("copied", eq, (res.path, opts.paste, copied, res.shift, opts.mode, res.overflow)))
+                stats = core.clipboard_stats(core.LAST_CLIPBOARD_SVG) if copied and core.LAST_CLIPBOARD_SVG else ""
+                self.q.put(("copied", eq, (res.path, opts.paste, copied, res.shift, opts.mode, res.overflow, stats)))
             except Exception as e:  # noqa: BLE001
                 self.q.put(("copy_error", 0, str(e)))
 
@@ -724,6 +740,9 @@ class App(ctk.CTk, _DnD):
         try:
             while True:
                 kind, key, payload = self.q.get_nowait()
+                if kind == "cancelled":
+                    self._busy = max(0, self._busy - 1)
+                    continue
                 if kind in ("preview", "error"):
                     self._busy = max(0, self._busy - 1)
                     if key == self.gen:           # results of outdated requests are dropped
@@ -746,15 +765,16 @@ class App(ctk.CTk, _DnD):
                     else:
                         self.set_status("Preview up to date.")
                 elif kind == "copied":
-                    path, mode, copied, shift, kind_, overflow = payload
+                    path, mode, copied, shift, kind_, overflow, stats = payload
                     self.btn_copy.configure(state="normal")
                     self._add_history(key, shift, kind_)
                     if kind_ == "text":
                         self.show_frame(overflow)
                     else:
                         self.show_shift(shift)
-                    self.set_status(f"Copied as {mode} - press Ctrl+V in Affinity." if copied
-                                    else f"Saved {path} (no clipboard support here).")
+                    what = f"Copied as {mode}" + (f": {stats}" if stats else "")
+                    self.set_status(f"{what} - press Ctrl+V in Affinity (on the canvas, not in a text frame)."
+                                    if copied else f"Saved {path} (no clipboard support here).")
                     self._log(f"wrote {path}")
                 elif kind == "copy_error":
                     self.btn_copy.configure(state="normal")
@@ -928,6 +948,16 @@ class App(ctk.CTk, _DnD):
             self.shift_label.configure(text=f"Baseline shift: {shift:.2f} pt".replace("-", MINUS))
             self.b_shift.configure(state="normal")
 
+    def save_clipboard_svg(self) -> None:
+        """Write exactly the SVG of the last copy to a file (debugging pastes into Affinity)."""
+        if not core.LAST_CLIPBOARD_SVG:
+            return self.set_status("Nothing copied yet in this session.", error=True)
+        path = filedialog.asksaveasfilename(parent=self, title="Save clipboard SVG", defaultextension=".svg",
+                                            initialfile="texclip_clipboard.svg", filetypes=[("SVG", "*.svg")])
+        if path:
+            Path(path).write_text(core.LAST_CLIPBOARD_SVG, encoding="utf-8")
+            self.set_status(f"Saved {Path(path).name}: {core.clipboard_stats(core.LAST_CLIPBOARD_SVG)}.")
+
     def copy_shift(self) -> None:
         """Only the number with an ASCII minus, for Affinity's Baseline shift field."""
         if self.shift is None:
@@ -947,6 +977,9 @@ class App(ctk.CTk, _DnD):
     def _log(self, msg: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", msg.strip() + "\n\n")
+        lines = int(self.log.index("end-1c").split(".")[0])
+        if lines > 600:                      # keep the log panel light
+            self.log.delete("1.0", f"{lines - 400}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
 

@@ -316,6 +316,69 @@ def test_text_block_has_the_frame_size(tmp_path, monkeypatch):
     assert abs(viewbox(tight)[3] - 5 * 72 / 25.4) < 0.01
 
 
+# ---- point 6: "curves" keeps separate glyphs, grouped by line and word --------------------
+@needs_tex
+@pytest.mark.tex
+def test_curves_mode_groups_lines_and_words(tmp_path, monkeypatch):
+    import re
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    text = ("The quick brown fox jumps over the lazy dog with $x^2+y_k$ inline. " * 4).strip()
+    svg = core.build(text, Options(mode="text", size=20, width="80mm")).read_text(encoding="utf-8")
+    curves = core.flatten_svg(svg, merge=False)
+    lines = re.findall(r'<g id="line\d+">', curves)
+    words = re.findall(r'<g id="line\d+_word\d+">', curves)
+    assert len(lines) >= 3 and len(words) > 2 * len(lines)          # several lines, words inside
+    assert "<use" not in curves and curves.count("<path") > 100     # every glyph its own path
+    assert "glyphs in" in core.clipboard_stats(curves)
+    assert core.clipboard_stats(core.flatten_svg(svg, merge=True)) == "one object"
+    first = re.search(r'<g id="line01">(.*?)</g>\s*</g>', curves, re.S).group(1)
+    assert len(re.findall(r'_word\d+"', first)) >= 5                # "The quick brown fox jumps ..."
+
+
+# ---- point 5: speed and stability ---------------------------------------------------------
+def test_run_timeout_and_cancel():
+    import sys
+    import threading
+    with pytest.raises(RuntimeError, match="did not finish"):
+        core.run([sys.executable, "-c", "import time; time.sleep(5)"], ".", tag="t1", timeout=0.5)
+    box = {}
+
+    def slow():
+        try:
+            core.run([sys.executable, "-c", "import time; time.sleep(10)"], ".", tag="t2")
+        except core.Cancelled:
+            box["cancelled"] = True
+
+    th = threading.Thread(target=slow)
+    th.start()
+    import time
+    for _ in range(50):                                  # wait until the process runs
+        if core._RUNNING.get("t2"):
+            break
+        time.sleep(0.05)
+    core.cancel("t2")
+    th.join(5)
+    assert box.get("cancelled")
+
+
+@needs_tex
+@pytest.mark.tex
+def test_copy_reuses_the_preview_compile(tmp_path, monkeypatch):
+    monkeypatch.setattr(core, "OUTDIR", tmp_path)
+    monkeypatch.setattr(core, "PREAMBLE_FILE", tmp_path / "none.tex")
+    monkeypatch.setattr(core, "CACHE_DIR", tmp_path / "cache")
+    calls = []
+    real = core._latex
+    monkeypatch.setattr(core, "_latex", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    a = Options(size=17)
+    core.render_preview(r"\sqrt{z}", a, dpi=60)
+    core.build_result(r"\sqrt{z}", a)                     # same document: no second latex run
+    assert len(calls) == 1
+    png1 = core.render_preview(r"\sqrt{z}", a, dpi=60)    # memory cache
+    assert len(calls) == 1 and png1[0][:4] == b"\x89PNG"
+
+
 @needs_tex
 @pytest.mark.tex
 def test_size_from_preamble_takes_effect(monkeypatch, tmp_path):
